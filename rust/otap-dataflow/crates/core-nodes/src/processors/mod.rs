@@ -25,6 +25,9 @@ pub mod partition_processor;
 /// Retry processor.
 pub mod retry_processor;
 
+/// Scale metric processor.
+pub mod scale_metric_processor;
+
 /// Transform processor.
 pub mod transform_processor;
 

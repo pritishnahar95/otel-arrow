@@ -1,0 +1,11 @@
+change_type: new_component
+
+component: pipeline
+
+note: Add a scale_metric processor that multiplies named metrics by a constant factor and optionally restates their unit.
+
+issues: []
+
+subtext: |
+  Gauges, sums, histograms and summaries are scaled. Exponential histograms cannot be scaled by a
+  constant factor, so a matched exponential histogram is left untouched and counted separately.

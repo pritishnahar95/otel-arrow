@@ -27,6 +27,7 @@ pub mod batching_tests;
 pub mod filter;
 pub mod groups;
 pub mod memory;
+pub mod metric_scale;
 pub mod raw_batch_store;
 pub mod schema;
 #[allow(missing_docs)]
