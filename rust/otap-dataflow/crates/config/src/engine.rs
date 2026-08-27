@@ -14,7 +14,7 @@ use crate::extension::ExtensionUserConfig;
 use crate::health::HealthPolicy;
 use crate::observed_state::ObservedStateSettings;
 use crate::pipeline::telemetry::TelemetryConfig;
-use crate::pipeline::{PipelineConfig, PipelineConnection, PipelineNodes};
+use crate::pipeline::{PipelineConfig, PipelineConnection, PipelineExtensions, PipelineNodes};
 use crate::pipeline_group::PipelineGroupConfig;
 use crate::policy::{ChannelCapacityPolicy, Policies, TelemetryPolicy};
 use crate::topic::{TopicImplSelectionPolicy, TopicSpec};
@@ -359,6 +359,13 @@ pub struct EngineObservabilityPipelineConfig {
     #[serde(default)]
     pub nodes: PipelineNodes,
 
+    /// Extensions available to the observability pipeline, keyed by extension ID.
+    ///
+    /// Scoped to this pipeline exactly like a data pipeline's `extensions`
+    /// section: observability nodes may only bind capabilities declared here.
+    #[serde(default, skip_serializing_if = "PipelineExtensions::is_empty")]
+    pub extensions: PipelineExtensions,
+
     /// Explicit graph connections for observability nodes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub connections: Vec<PipelineConnection>,
@@ -404,6 +411,7 @@ impl EngineObservabilityPipelineConfig {
             self.policies
                 .map(EngineObservabilityPolicies::into_policies),
             self.nodes,
+            self.extensions,
             self.connections,
         )
     }
@@ -905,6 +913,88 @@ groups: {}
 "#;
 
         let _config = OtelDataflowSpec::from_yaml(yaml).expect("ITS metrics config should parse");
+    }
+
+    /// Scenario: an observability node binds a capability to an extension declared in the
+    /// observability pipeline's own `extensions` section.
+    /// Guarantees: the observability pipeline can supply extensions to its nodes, so exporters
+    /// there can authenticate the same way data-pipeline exporters do.
+    #[test]
+    fn from_yaml_accepts_observability_pipeline_with_extensions() {
+        let yaml = r#"
+version: otel_dataflow/v1
+engine:
+  observability:
+    pipeline:
+      extensions:
+        azure_identity:
+          type: "urn:microsoft:extension:azure_identity_auth"
+          config:
+            method: managed_identity
+      nodes:
+        itr:
+          type: "receiver:internal_telemetry"
+          config:
+            metrics: {}
+        sink:
+          type: "exporter:otlp_grpc"
+          capabilities:
+            bearer_token_provider: azure_identity
+          config:
+            grpc_endpoint: "https://example.invalid:4317"
+      connections:
+        - from: itr
+          to: sink
+groups: {}
+"#;
+
+        let config =
+            OtelDataflowSpec::from_yaml(yaml).expect("observability extensions should parse");
+        let pipeline = config
+            .engine
+            .observability
+            .pipeline
+            .clone()
+            .into_pipeline_config();
+        assert!(
+            pipeline.extensions().contains_key("azure_identity"),
+            "the declared extension must survive conversion to the runtime pipeline config"
+        );
+    }
+
+    /// Scenario: an observability node binds a capability to an extension that is not declared.
+    /// Guarantees: the observability pipeline validates capability bindings against its own
+    /// `extensions` section rather than silently dropping the binding.
+    #[test]
+    fn from_yaml_rejects_observability_capability_binding_without_extension() {
+        let yaml = r#"
+version: otel_dataflow/v1
+engine:
+  observability:
+    pipeline:
+      nodes:
+        itr:
+          type: "receiver:internal_telemetry"
+          config:
+            metrics: {}
+        sink:
+          type: "exporter:otlp_grpc"
+          capabilities:
+            bearer_token_provider: missing_extension
+          config:
+            grpc_endpoint: "https://example.invalid:4317"
+      connections:
+        - from: itr
+          to: sink
+groups: {}
+"#;
+
+        let err = OtelDataflowSpec::from_yaml(yaml)
+            .expect_err("an unresolved capability binding must be rejected");
+        assert!(
+            err.to_string().contains("missing_extension"),
+            "unexpected validation error: {err}"
+        );
     }
 
     /// Scenario: a configuration uses the removed engine telemetry metrics field.
