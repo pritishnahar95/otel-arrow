@@ -74,14 +74,35 @@ Supported `apply_to` values are `signal`, `resource`, and `scope`.
 Supported actions:
 
 - `delete` requires `key` and deletes an attribute.
-- `insert` requires `key` and `value`, and inserts a value only when the key is
+- `insert` requires `key` and a value, and inserts it only when the key is
   absent.
-- `upsert` requires `key` and `value`, and inserts or replaces a value.
+- `upsert` requires `key` and a value, and inserts or replaces a value.
 - `update` requires `key` and `value`, and replaces a value only when the key
   exists.
 - `rename` requires `source_key` and `destination_key`, and renames an
   attribute key.
 - `hash` requires `key` and replaces a scalar value with a salted hash.
+
+`insert` and `upsert` take their value either from a literal `value` or from a
+`from_attribute` reference to another attribute. Exactly one of the two must be
+set. A `from_attribute` reference names the attribute set to read from with
+`scope` (`resource`, `scope`, or `record`) and the attribute to read with `key`,
+so a record attribute can be filled from the resource or scope that record
+belongs to:
+
+```yaml
+actions:
+  - action: insert
+    key: instanceId
+    from_attribute:
+      scope: resource
+      key: service.instance.id
+```
+
+Records whose referenced attribute is missing are left untouched.
+
+Actions of one kind compose into a single map keyed by attribute key, so two
+`insert` actions (or two `upsert` actions) may not target the same key.
 
 `hash.algorithm` defaults to `sha256`; `hash.salt` defaults to an empty string.
 Unsupported action variants are accepted for forward compatibility and ignored.

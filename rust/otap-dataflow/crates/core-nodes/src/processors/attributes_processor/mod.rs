@@ -32,6 +32,18 @@
 //!   # apply_to: ["signal", "resource"]  # Optional; defaults to ["signal"]
 //! ```
 //!
+//! `insert` and `upsert` take either a literal `value` or a `from_attribute` reference that
+//! copies the value of another attribute. The referenced attribute may live on the resource or
+//! scope the record belongs to, not just on the record itself:
+//! ```yaml
+//! actions:
+//!   - action: "insert"
+//!     key: "instanceId"
+//!     from_attribute:
+//!       scope: "resource"           # resource, scope, or record
+//!       key: "service.instance.id"
+//! ```
+//!
 //! Implementation uses otel_arrow_dfe_pdata::otap::transform::transform_attributes for
 //! efficient batch processing of Arrow record batches.
 
@@ -62,8 +74,9 @@ use otel_arrow_dfe_pdata::otap::transform::apply_attribute_transform;
 use otel_arrow_dfe_pdata::otap::{
     OtapArrowRecords,
     transform::{
-        AttributesTransform, DeleteTransform, HashSpec, HashTransform, InsertTransform,
-        LiteralValue, RenameTransform, UpdateTransform, UpsertTransform,
+        AttributeValueSource, AttributesTransform, DeleteTransform, HashSpec, HashTransform,
+        InsertTransform, LiteralValue, RenameTransform, UpdateTransform, UpsertTransform,
+        attribute_source::AttributeSourceScope,
     },
 };
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
@@ -100,16 +113,24 @@ pub enum Action {
     Insert {
         /// The attribute key to insert.
         key: String,
-        /// The value to insert.
-        value: LiteralValue,
+        /// The literal value to insert. Mutually exclusive with `from_attribute`.
+        #[serde(default)]
+        value: Option<LiteralValue>,
+        /// The attribute to copy the value from. Mutually exclusive with `value`.
+        #[serde(default)]
+        from_attribute: Option<AttributeRef>,
     },
 
     /// Upsert an attribute: insert if key doesn't exist, or update value if it does.
     Upsert {
         /// The attribute key to upsert.
         key: String,
-        /// The value to upsert.
-        value: LiteralValue,
+        /// The literal value to upsert. Mutually exclusive with `from_attribute`.
+        #[serde(default)]
+        value: Option<LiteralValue>,
+        /// The attribute to copy the value from. Mutually exclusive with `value`.
+        #[serde(default)]
+        from_attribute: Option<AttributeRef>,
     },
 
     /// Update an existing attribute without inserting missing keys.
@@ -146,12 +167,60 @@ pub enum Action {
     Unsupported,
 }
 
+/// Reference to an attribute whose value is copied onto the transformed records.
+///
+/// The referenced attribute does not have to live on the records being transformed: a record
+/// attribute can be sourced from the resource or scope the record belongs to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttributeRef {
+    /// Which attribute set to read the value from: `resource`, `scope`, or `record`.
+    pub scope: AttributeSourceScope,
+    /// The key to read.
+    pub key: String,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 /// Supported hash algorithms for the `hash` action.
 pub enum HashAlgorithm {
     /// SHA-256.
     Sha256,
+}
+
+/// Turns the mutually exclusive `value` and `from_attribute` config fields into a value source.
+fn value_source(
+    action: &str,
+    key: &str,
+    value: Option<LiteralValue>,
+    from_attribute: Option<AttributeRef>,
+) -> Result<AttributeValueSource, ConfigError> {
+    match (value, from_attribute) {
+        (Some(value), None) => Ok(AttributeValueSource::Literal(value)),
+        (None, Some(source)) => Ok(AttributeValueSource::FromAttribute {
+            scope: source.scope,
+            key: source.key,
+        }),
+        (Some(_), Some(_)) => Err(ConfigError::InvalidUserConfig {
+            error: format!(
+                "{action} action for key '{key}' sets both 'value' and 'from_attribute'; set exactly one"
+            ),
+        }),
+        (None, None) => Err(ConfigError::InvalidUserConfig {
+            error: format!(
+                "{action} action for key '{key}' sets neither 'value' nor 'from_attribute'; set exactly one"
+            ),
+        }),
+    }
+}
+
+/// Actions of the same kind are composed into a single map keyed by attribute key, so two
+/// actions writing the same key would silently discard one of them.
+fn duplicate_key_error(action: &str, key: &str) -> ConfigError {
+    ConfigError::InvalidUserConfig {
+        error: format!(
+            "multiple {action} actions target key '{key}'; a key may be written by at most one {action} action"
+        ),
+    }
 }
 
 const fn default_hash_algorithm() -> HashAlgorithm {
@@ -235,11 +304,25 @@ impl AttributesProcessor {
                 } => {
                     let _ = renames.insert(source_key, destination_key);
                 }
-                Action::Insert { key, value } => {
-                    let _ = inserts.insert(key, value);
+                Action::Insert {
+                    key,
+                    value,
+                    from_attribute,
+                } => {
+                    let source = value_source("insert", &key, value, from_attribute)?;
+                    if inserts.insert(key.clone(), source).is_some() {
+                        return Err(duplicate_key_error("insert", &key));
+                    }
                 }
-                Action::Upsert { key, value } => {
-                    let _ = upserts.insert(key, value);
+                Action::Upsert {
+                    key,
+                    value,
+                    from_attribute,
+                } => {
+                    let source = value_source("upsert", &key, value, from_attribute)?;
+                    if upserts.insert(key.clone(), source).is_some() {
+                        return Err(duplicate_key_error("upsert", &key));
+                    }
                 }
                 Action::Update { key, value } => {
                     let _ = updates.insert(key, value);
@@ -286,12 +369,12 @@ impl AttributesProcessor {
             insert: if inserts.is_empty() {
                 None
             } else {
-                Some(InsertTransform::new(inserts))
+                Some(InsertTransform::with_sources(inserts))
             },
             upsert: if upserts.is_empty() {
                 None
             } else {
-                Some(UpsertTransform::new(upserts))
+                Some(UpsertTransform::with_sources(upserts))
             },
             update: if updates.is_empty() {
                 None
@@ -638,6 +721,137 @@ mod tests {
                 ],
             )],
         )])
+    }
+
+    fn pipeline_ctx() -> PipelineContext {
+        ControllerContext::new(TelemetryRegistryHandle::new()).pipeline_context_with(
+            "grp".into(),
+            "pipeline".into(),
+            0,
+            1,
+            0,
+        )
+    }
+
+    /// Scenario: A `from_attribute` insert copies a resource attribute onto every log record.
+    /// Guarantees: The record attribute carries the resource's value, so the internal telemetry
+    /// pipeline can promote resource identity onto records without a transform language.
+    #[test]
+    fn test_insert_from_resource_attribute_copies_value_onto_records() {
+        let input = build_logs_with_attrs(
+            vec![KeyValue::new(
+                "service.instance.id",
+                AnyValue::new_string("instance-1"),
+            )],
+            vec![],
+            vec![KeyValue::new("keep", AnyValue::new_string("unchanged"))],
+        );
+
+        let cfg = json!({
+            "actions": [
+                {
+                    "action": "insert",
+                    "key": "instanceId",
+                    "from_attribute": {"scope": "resource", "key": "service.instance.id"}
+                }
+            ]
+        });
+
+        let node = test_node("attributes-processor-from-attribute-test");
+        let rt: TestRuntime<OtapPdata> = TestRuntime::new();
+        let mut node_config = NodeUserConfig::new_processor_config(ATTRIBUTES_PROCESSOR_URN);
+        node_config.config = cfg;
+        let proc =
+            create_attributes_processor(pipeline_ctx(), node, Arc::new(node_config), rt.config())
+                .expect("create processor");
+        let phase = rt.set_processor(proc);
+
+        phase
+            .run_test(|mut ctx| async move {
+                let mut bytes = BytesMut::new();
+                input.encode(&mut bytes).expect("encode");
+                let pdata_in = OtapPdata::new_default(
+                    OtlpProtoBytes::ExportLogsRequest(bytes.freeze()).into(),
+                );
+                ctx.process(Message::PData(pdata_in))
+                    .await
+                    .expect("process");
+
+                let out = ctx.drain_pdata().await;
+                let first = out.into_iter().next().expect("one output").payload();
+                let otlp_bytes: OtlpProtoBytes =
+                    first.try_into_with_default().expect("convert to otlp");
+                let OtlpProtoBytes::ExportLogsRequest(bytes) = otlp_bytes else {
+                    panic!("unexpected otlp variant")
+                };
+                let decoded = ExportLogsServiceRequest::decode(bytes.as_ref()).expect("decode");
+
+                let log_attrs = &decoded.resource_logs[0].scope_logs[0].log_records[0].attributes;
+                assert_eq!(
+                    log_attrs
+                        .iter()
+                        .find(|kv| kv.key == "instanceId")
+                        .and_then(|kv| kv.value.as_ref()),
+                    Some(&AnyValue::new_string("instance-1"))
+                );
+                assert!(
+                    log_attrs.iter().any(|kv| kv.key == "keep"
+                        && kv.value == Some(AnyValue::new_string("unchanged")))
+                );
+            })
+            .validate(|_| async move {});
+    }
+
+    /// Scenario: An insert action sets both a literal value and a `from_attribute` reference.
+    /// Guarantees: The ambiguity is rejected at config time instead of one form winning silently.
+    #[test]
+    fn test_insert_with_both_value_and_from_attribute_is_rejected() {
+        let cfg = json!({
+            "actions": [
+                {
+                    "action": "insert",
+                    "key": "instanceId",
+                    "value": "literal",
+                    "from_attribute": {"scope": "resource", "key": "service.instance.id"}
+                }
+            ]
+        });
+        let Err(err) = AttributesProcessor::from_config(pipeline_ctx(), &cfg) else {
+            panic!("both value forms should be rejected")
+        };
+        assert!(format!("{err}").contains("set exactly one"), "{err}");
+    }
+
+    /// Scenario: An insert action sets neither a value nor a `from_attribute` reference.
+    /// Guarantees: The action is rejected rather than inserting an empty attribute.
+    #[test]
+    fn test_insert_without_a_value_is_rejected() {
+        let cfg = json!({"actions": [{"action": "insert", "key": "instanceId"}]});
+        let Err(err) = AttributesProcessor::from_config(pipeline_ctx(), &cfg) else {
+            panic!("a value-less insert should be rejected")
+        };
+        assert!(format!("{err}").contains("set exactly one"), "{err}");
+    }
+
+    /// Scenario: Two insert actions target the same attribute key.
+    /// Guarantees: The config is rejected, because actions of one kind compose into a map keyed
+    /// by attribute key and one of the two would otherwise be discarded without a trace.
+    #[test]
+    fn test_two_inserts_targeting_the_same_key_are_rejected() {
+        let cfg = json!({
+            "actions": [
+                {"action": "insert", "key": "componentName", "value": "a"},
+                {
+                    "action": "insert",
+                    "key": "componentName",
+                    "from_attribute": {"scope": "scope", "key": "custom.componentName"}
+                }
+            ]
+        });
+        let Err(err) = AttributesProcessor::from_config(pipeline_ctx(), &cfg) else {
+            panic!("duplicate insert keys should be rejected")
+        };
+        assert!(format!("{err}").contains("at most one"), "{err}");
     }
 
     #[test]

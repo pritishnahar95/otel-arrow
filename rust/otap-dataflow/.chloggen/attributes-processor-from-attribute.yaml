@@ -1,0 +1,13 @@
+change_type: enhancement
+
+component: pipeline
+
+note: The attribute processor's insert and upsert actions can take their value from another attribute.
+
+issues: []
+
+subtext: |
+  An action sets either a literal `value` or a `from_attribute` reference naming a `scope`
+  (resource, scope, or record) and a `key`, so a record attribute can be filled from the resource
+  or scope it belongs to. Two actions of the same kind targeting one key are now rejected instead
+  of silently discarding one of them.
