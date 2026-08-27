@@ -141,8 +141,31 @@ Records whose value does not match the pattern are left untouched, so several
 actions can read different groups of one pattern to split a single attribute
 into several.
 
-Actions of one kind compose into a single map keyed by attribute key, so two
-`insert` actions (or two `upsert` actions) may not target the same key.
+Actions are applied in the order they are configured. Since `insert` leaves an
+existing key alone, repeating it on one key expresses a fallback chain where the
+first source that resolves wins:
+
+```yaml
+actions:
+  - action: insert
+    key: componentName
+    from_attribute: { scope: scope, key: custom.componentName }
+  - action: insert
+    key: componentName
+    from_attribute: { scope: scope, key: node.id }
+    condition: { scope: scope, key: node.type, equals: receiver }
+  - action: insert
+    key: componentName
+    from_attribute:
+      scope: scope
+      key: flow.id
+      pattern: "^(?P<pipelineName>[^/]+)/(?P<componentName>.+)$"
+      group: componentName
+```
+
+Actions that touch unrelated keys are applied together in a single pass over the
+batch. Only an action writing a key that an earlier action writes or reads
+starts a new pass, so ordering costs nothing unless it is actually relied on.
 
 `hash.algorithm` defaults to `sha256`; `hash.salt` defaults to an empty string.
 Unsupported action variants are accepted for forward compatibility and ignored.

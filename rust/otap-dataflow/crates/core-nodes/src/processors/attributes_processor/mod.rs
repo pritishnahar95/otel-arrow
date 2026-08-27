@@ -62,6 +62,19 @@
 //!       group: "pipelineName"
 //! ```
 //!
+//! Actions are applied in the order they are configured. Since `insert` leaves an existing key
+//! alone, repeating it on one key expresses a fallback chain where the first source that resolves
+//! wins:
+//! ```yaml
+//! actions:
+//!   - action: "insert"
+//!     key: "componentName"
+//!     from_attribute: { scope: "scope", key: "custom.componentName" }
+//!   - action: "insert"
+//!     key: "componentName"
+//!     from_attribute: { scope: "scope", key: "node.id" }
+//! ```
+//!
 //! Implementation uses otel_arrow_dfe_pdata::otap::transform::transform_attributes for
 //! efficient batch processing of Arrow record batches.
 
@@ -304,13 +317,68 @@ fn assignment(
     })
 }
 
-/// Actions of the same kind are composed into a single map keyed by attribute key, so two
-/// actions writing the same key would silently discard one of them.
-fn duplicate_key_error(action: &str, key: &str) -> ConfigError {
-    ConfigError::InvalidUserConfig {
-        error: format!(
-            "multiple {action} actions target key '{key}'; a key may be written by at most one {action} action"
-        ),
+/// The keys an action reads, which an earlier action in the same pass must not have written.
+fn read_keys(from_attribute: Option<&AttributeRef>, condition: Option<&Condition>) -> Vec<String> {
+    from_attribute
+        .map(|source| source.key.clone())
+        .into_iter()
+        .chain(condition.map(|condition| condition.key.clone()))
+        .collect()
+}
+
+/// The actions of a single [`AttributesTransform`] application.
+#[derive(Default)]
+struct TransformPass {
+    renames: BTreeMap<String, String>,
+    deletes: BTreeSet<String>,
+    inserts: BTreeMap<String, AttributeAssignment>,
+    upserts: BTreeMap<String, AttributeAssignment>,
+    updates: BTreeMap<String, LiteralValue>,
+    hashes: BTreeMap<String, HashSpec>,
+    written: BTreeSet<String>,
+}
+
+impl TransformPass {
+    fn into_transform(self) -> AttributesTransform {
+        AttributesTransform {
+            rename: (!self.renames.is_empty()).then(|| RenameTransform::new(self.renames)),
+            delete: (!self.deletes.is_empty()).then(|| DeleteTransform::new(self.deletes)),
+            insert: (!self.inserts.is_empty())
+                .then(|| InsertTransform::with_assignments(self.inserts)),
+            upsert: (!self.upserts.is_empty())
+                .then(|| UpsertTransform::with_assignments(self.upserts)),
+            update: (!self.updates.is_empty()).then(|| UpdateTransform::new(self.updates)),
+            hash: (!self.hashes.is_empty()).then(|| HashTransform::new(self.hashes)),
+        }
+    }
+}
+
+/// Composes the configured actions into the fewest transform passes that still honor their order.
+///
+/// A pass applies its actions as a set rather than in sequence, so an action lands in a new pass
+/// once the current one already writes a key it writes or reads. Independent actions therefore
+/// still cost a single pass, while a chain of actions writing one key stays ordered: with `insert`
+/// leaving existing keys alone, repeated inserts of a key fall back to each other in order.
+#[derive(Default)]
+struct TransformPlan {
+    passes: Vec<TransformPass>,
+}
+
+impl TransformPlan {
+    fn pass_for(&mut self, writes: &[&str], reads: &[String]) -> &mut TransformPass {
+        let fits = self.passes.last().is_some_and(|pass| {
+            writes.iter().all(|key| !pass.written.contains(*key))
+                && reads.iter().all(|key| !pass.written.contains(key))
+        });
+        if !fits {
+            self.passes.push(TransformPass::default());
+        }
+
+        let pass = self.passes.last_mut().expect("a pass is present");
+        for key in writes {
+            let _ = pass.written.insert((*key).to_owned());
+        }
+        pass
     }
 }
 
@@ -343,8 +411,8 @@ pub struct Config {
 /// efficient Arrow operations across all attribute types (resource, scope, and
 /// signal-specific attributes) for logs, metrics, and traces telemetry.
 pub struct AttributesProcessor {
-    // Pre-computed transform to avoid rebuilding per message
-    transform: AttributesTransform,
+    // Pre-computed transform passes, applied in order, to avoid rebuilding per message
+    transforms: Vec<AttributesTransform>,
     // Pre-computed flags for domain lookup
     has_resource_domain: bool,
     has_scope_domain: bool,
@@ -377,23 +445,20 @@ impl AttributesProcessor {
         pipeline_ctx: PipelineContext,
         config: Config,
     ) -> Result<Self, otel_arrow_dfe_config::error::Error> {
-        let mut renames = BTreeMap::new();
-        let mut deletes = BTreeSet::new();
-        let mut inserts = BTreeMap::new();
-        let mut upserts = BTreeMap::new();
-        let mut updates = BTreeMap::new();
-        let mut hashes = BTreeMap::new();
+        let mut plan = TransformPlan::default();
 
         for action in config.actions {
             match action {
                 Action::Delete { key } => {
-                    let _ = deletes.insert(key);
+                    let pass = plan.pass_for(&[key.as_str()], &[]);
+                    let _ = pass.deletes.insert(key);
                 }
                 Action::Rename {
                     source_key,
                     destination_key,
                 } => {
-                    let _ = renames.insert(source_key, destination_key);
+                    let pass = plan.pass_for(&[source_key.as_str(), destination_key.as_str()], &[]);
+                    let _ = pass.renames.insert(source_key, destination_key);
                 }
                 Action::Insert {
                     key,
@@ -401,10 +466,10 @@ impl AttributesProcessor {
                     from_attribute,
                     condition,
                 } => {
+                    let reads = read_keys(from_attribute.as_ref(), condition.as_ref());
                     let entry = assignment("insert", &key, value, from_attribute, condition)?;
-                    if inserts.insert(key.clone(), entry).is_some() {
-                        return Err(duplicate_key_error("insert", &key));
-                    }
+                    let pass = plan.pass_for(&[key.as_str()], &reads);
+                    let _ = pass.inserts.insert(key, entry);
                 }
                 Action::Upsert {
                     key,
@@ -412,13 +477,14 @@ impl AttributesProcessor {
                     from_attribute,
                     condition,
                 } => {
+                    let reads = read_keys(from_attribute.as_ref(), condition.as_ref());
                     let entry = assignment("upsert", &key, value, from_attribute, condition)?;
-                    if upserts.insert(key.clone(), entry).is_some() {
-                        return Err(duplicate_key_error("upsert", &key));
-                    }
+                    let pass = plan.pass_for(&[key.as_str()], &reads);
+                    let _ = pass.upserts.insert(key, entry);
                 }
                 Action::Update { key, value } => {
-                    let _ = updates.insert(key, value);
+                    let pass = plan.pass_for(&[key.as_str()], &[]);
+                    let _ = pass.updates.insert(key, value);
                 }
                 Action::Hash {
                     key,
@@ -426,7 +492,8 @@ impl AttributesProcessor {
                     salt,
                 } => match algorithm {
                     HashAlgorithm::Sha256 => {
-                        let _ = hashes.insert(key, HashSpec::sha256(salt.into_inner()));
+                        let pass = plan.pass_for(&[key.as_str()], &[]);
+                        let _ = pass.hashes.insert(key, HashSpec::sha256(salt.into_inner()));
                     }
                 },
                 // Unsupported actions are ignored for now
@@ -441,54 +508,23 @@ impl AttributesProcessor {
         let has_scope_domain = domains.contains(&ApplyDomain::Scope);
         let has_signal_domain = domains.contains(&ApplyDomain::Signal);
 
-        // TODO: Optimize action composition into a valid AttributesTransform that
-        // still reflects the user's intended semantics. Consider:
-        // - detecting and collapsing simple rename chains (e.g., a->b, b->c => a->c)
-        // - detecting cycles or duplicate destinations and falling back to serial
-        //   application of transforms when a composed map would be invalid.
-        // For now, we compose a single transform and let transform_attributes
-        // enforce validity (which may error for conflicting maps).
-        let transform = AttributesTransform {
-            rename: if renames.is_empty() {
-                None
-            } else {
-                Some(RenameTransform::new(renames))
-            },
-            delete: if deletes.is_empty() {
-                None
-            } else {
-                Some(DeleteTransform::new(deletes))
-            },
-            insert: if inserts.is_empty() {
-                None
-            } else {
-                Some(InsertTransform::with_assignments(inserts))
-            },
-            upsert: if upserts.is_empty() {
-                None
-            } else {
-                Some(UpsertTransform::with_assignments(upserts))
-            },
-            update: if updates.is_empty() {
-                None
-            } else {
-                Some(UpdateTransform::new(updates))
-            },
-            hash: if hashes.is_empty() {
-                None
-            } else {
-                Some(HashTransform::new(hashes))
-            },
-        };
+        // TODO: collapse simple rename chains (e.g. a->b, b->c => a->c) into a single pass.
+        let transforms: Vec<AttributesTransform> = plan
+            .passes
+            .into_iter()
+            .map(TransformPass::into_transform)
+            .collect();
 
-        transform.validate().map_err(|e| {
-            otel_arrow_dfe_config::error::Error::InvalidUserConfig {
-                error: format!("Invalid attribute transform configuration: {e}"),
-            }
-        })?;
+        for transform in &transforms {
+            transform.validate().map_err(|e| {
+                otel_arrow_dfe_config::error::Error::InvalidUserConfig {
+                    error: format!("Invalid attribute transform configuration: {e}"),
+                }
+            })?;
+        }
 
         Ok(Self {
-            transform,
+            transforms,
             has_resource_domain,
             has_scope_domain,
             has_signal_domain,
@@ -498,13 +534,8 @@ impl AttributesProcessor {
     }
 
     #[inline]
-    const fn is_noop(&self) -> bool {
-        self.transform.rename.is_none()
-            && self.transform.delete.is_none()
-            && self.transform.insert.is_none()
-            && self.transform.upsert.is_none()
-            && self.transform.update.is_none()
-            && self.transform.hash.is_none()
+    fn is_noop(&self) -> bool {
+        self.transforms.is_empty()
     }
 
     #[allow(clippy::result_large_err)]
@@ -530,15 +561,17 @@ impl AttributesProcessor {
                 let mut updated = 0u64;
                 let mut hashed = 0u64;
                 for &payload_ty in payloads {
-                    let stats =
-                        apply_attribute_transform(records, payload_ty, &self.transform, true)?
-                            .unwrap_or_default();
-                    deleted += stats.deleted_entries;
-                    renamed += stats.renamed_entries;
-                    inserted += stats.inserted_entries;
-                    upserted += stats.upserted_entries;
-                    updated += stats.updated_entries;
-                    hashed += stats.hashed_entries;
+                    for transform in &self.transforms {
+                        let stats =
+                            apply_attribute_transform(records, payload_ty, transform, true)?
+                                .unwrap_or_default();
+                        deleted += stats.deleted_entries;
+                        renamed += stats.renamed_entries;
+                        inserted += stats.inserted_entries;
+                        upserted += stats.upserted_entries;
+                        updated += stats.updated_entries;
+                        hashed += stats.hashed_entries;
+                    }
                 }
                 Ok((deleted, renamed, inserted, upserted, updated, hashed))
             };
@@ -927,10 +960,10 @@ mod tests {
     }
 
     /// Scenario: Two insert actions target the same attribute key.
-    /// Guarantees: The config is rejected, because actions of one kind compose into a map keyed
-    /// by attribute key and one of the two would otherwise be discarded without a trace.
+    /// Guarantees: They are planned as two ordered passes rather than composed into one map,
+    /// which is what lets the second act as a fallback for the first.
     #[test]
-    fn test_two_inserts_targeting_the_same_key_are_rejected() {
+    fn test_two_inserts_targeting_the_same_key_become_two_passes() {
         let cfg = json!({
             "actions": [
                 {"action": "insert", "key": "componentName", "value": "a"},
@@ -941,10 +974,95 @@ mod tests {
                 }
             ]
         });
-        let Err(err) = AttributesProcessor::from_config(pipeline_ctx(), &cfg) else {
-            panic!("duplicate insert keys should be rejected")
+        let parsed = AttributesProcessor::from_config(pipeline_ctx(), &cfg).expect("config parse");
+        assert_eq!(parsed.transforms.len(), 2);
+    }
+
+    /// Scenario: A key is inserted from several sources in order, as the Go collector's attributes
+    /// processor expresses a fallback chain.
+    /// Guarantees: The first source that resolves wins, and a source that does not resolve leaves
+    /// the following one to fill the key.
+    #[test]
+    fn test_repeated_inserts_form_a_fallback_chain() {
+        let cfg = json!({
+            "actions": [
+                {
+                    "action": "insert",
+                    "key": "componentName",
+                    "from_attribute": {"scope": "scope", "key": "custom.componentName"}
+                },
+                {
+                    "action": "insert",
+                    "key": "componentName",
+                    "from_attribute": {"scope": "scope", "key": "node.id"}
+                }
+            ]
+        });
+
+        let component_name_for = |scope_attrs: Vec<KeyValue>| {
+            let input = build_logs_with_attrs(vec![], scope_attrs, vec![]);
+
+            let rt: TestRuntime<OtapPdata> = TestRuntime::new();
+            let mut node_config = NodeUserConfig::new_processor_config(ATTRIBUTES_PROCESSOR_URN);
+            node_config.config = cfg.clone();
+            let proc = create_attributes_processor(
+                pipeline_ctx(),
+                test_node("attributes-processor-fallback-test"),
+                Arc::new(node_config),
+                rt.config(),
+            )
+            .expect("create processor");
+            let phase = rt.set_processor(proc);
+
+            let found = Arc::new(std::sync::Mutex::new(None));
+            let captured = Arc::clone(&found);
+            phase
+                .run_test(move |mut ctx| async move {
+                    let mut bytes = BytesMut::new();
+                    input.encode(&mut bytes).expect("encode");
+                    let pdata_in = OtapPdata::new_default(
+                        OtlpProtoBytes::ExportLogsRequest(bytes.freeze()).into(),
+                    );
+                    ctx.process(Message::PData(pdata_in))
+                        .await
+                        .expect("process");
+
+                    let out = ctx.drain_pdata().await;
+                    let first = out.into_iter().next().expect("one output").payload();
+                    let otlp_bytes: OtlpProtoBytes =
+                        first.try_into_with_default().expect("convert to otlp");
+                    let OtlpProtoBytes::ExportLogsRequest(bytes) = otlp_bytes else {
+                        panic!("unexpected otlp variant")
+                    };
+                    let decoded = ExportLogsServiceRequest::decode(bytes.as_ref()).expect("decode");
+                    *captured.lock().expect("lock") = decoded.resource_logs[0].scope_logs[0]
+                        .log_records[0]
+                        .attributes
+                        .iter()
+                        .find(|kv| kv.key == "componentName")
+                        .and_then(|kv| kv.value.clone());
+                })
+                .validate(|_| async move {});
+
+            found.lock().expect("lock").clone()
         };
-        assert!(format!("{err}").contains("at most one"), "{err}");
+
+        assert_eq!(
+            component_name_for(vec![
+                KeyValue::new("custom.componentName", AnyValue::new_string("batcher")),
+                KeyValue::new("node.id", AnyValue::new_string("otlp-in")),
+            ]),
+            Some(AnyValue::new_string("batcher")),
+            "the first source wins when it resolves"
+        );
+        assert_eq!(
+            component_name_for(vec![KeyValue::new(
+                "node.id",
+                AnyValue::new_string("otlp-in")
+            )]),
+            Some(AnyValue::new_string("otlp-in")),
+            "the second source fills the key when the first does not resolve"
+        );
     }
 
     /// Scenario: A conditional insert copies `node.id` only where `node.type` is `receiver`.
@@ -1166,10 +1284,12 @@ mod tests {
         let pipeline_ctx =
             controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
         let parsed = AttributesProcessor::from_config(pipeline_ctx, &cfg).expect("config parse");
-        assert!(parsed.transform.rename.is_some());
-        assert!(parsed.transform.delete.is_some());
-        assert!(parsed.transform.update.is_some());
-        assert!(parsed.transform.hash.is_some());
+        assert_eq!(parsed.transforms.len(), 1, "actions target distinct keys");
+        let transform = &parsed.transforms[0];
+        assert!(transform.rename.is_some());
+        assert!(transform.delete.is_some());
+        assert!(transform.update.is_some());
+        assert!(transform.hash.is_some());
         // default apply_to should include Signal
         assert!(parsed.has_signal_domain);
         // and not necessarily Resource/Scope unless specified

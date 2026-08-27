@@ -1,0 +1,9 @@
+change_type: bug_fix
+
+component: pipeline
+
+note: The attributes processor applies its actions in the configured order instead of composing them all into a single pass
+
+issues: []
+
+subtext: Repeated insert actions on one key now express a fallback chain, matching the Go collector. Actions on unrelated keys still share a single pass over the batch.
