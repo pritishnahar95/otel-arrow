@@ -1,0 +1,12 @@
+change_type: enhancement
+
+component: pdata
+
+note: Attribute insert and upsert transforms can now source their value from another payload's attributes.
+
+issues: []
+
+subtext: |
+  A value can reference a resource, scope, or record attribute instead of a literal. The value is
+  resolved per row by walking the parent-id chain, so data point attributes can be filled from the
+  resource or scope they belong to. Rows whose source is missing are left untouched.

@@ -3,7 +3,7 @@
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::{AddAssign, Deref, Range};
 use std::sync::Arc;
 
@@ -14,7 +14,7 @@ use arrow::array::{
 };
 use arrow::buffer::{BooleanBuffer, Buffer, MutableBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::compute::kernels::cmp::{eq, gt_eq, lt};
-use arrow::compute::{SortColumn, and, cast, filter, max, not};
+use arrow::compute::{SortColumn, and, cast, filter, max, not, take};
 use arrow::datatypes::{
     ArrowDictionaryKeyType, ArrowNativeType, DataType, Field, Schema, UInt8Type, UInt16Type,
     UInt32Type,
@@ -31,6 +31,7 @@ use crate::arrays::{
 };
 use crate::error::{Error, Result};
 use crate::otap::filter::IdBitmap;
+use crate::otap::transform::attribute_source::{AttributeSourceScope, resolve_source_values};
 use crate::otap::transform::transport_optimize::remove_transport_optimized_encodings;
 use crate::otap::transform::upsert_attributes::{
     AttributeUpsert, EMPTY_U16_ATTRS_RECORD_BATCH, EMPTY_U32_ATTRS_RECORD_BATCH,
@@ -41,6 +42,7 @@ use crate::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 use crate::schema::consts::{self, metadata};
 use crate::schema::{get_field_metadata, update_field_metadata};
 
+pub mod attribute_source;
 pub mod concatenate;
 pub mod reindex;
 pub mod sanitize;
@@ -720,13 +722,57 @@ impl From<&LiteralValue> for ScalarValue {
     }
 }
 
+/// Where the value written by an insert or upsert comes from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AttributeValueSource {
+    /// A constant, broadcast to every parent.
+    Literal(LiteralValue),
+
+    /// The value of another attribute, resolved per parent.
+    FromAttribute {
+        /// The payload the value is read from, relative to the record being written.
+        scope: AttributeSourceScope,
+        /// The key to read.
+        key: String,
+    },
+}
+
+impl From<LiteralValue> for AttributeValueSource {
+    fn from(value: LiteralValue) -> Self {
+        Self::Literal(value)
+    }
+}
+
+fn literal_entries(
+    entries: BTreeMap<String, LiteralValue>,
+) -> BTreeMap<String, AttributeValueSource> {
+    entries
+        .into_iter()
+        .map(|(key, value)| (key, value.into()))
+        .collect()
+}
+
+fn has_source_entries(entries: &BTreeMap<String, AttributeValueSource>) -> bool {
+    entries
+        .values()
+        .any(|value| matches!(value, AttributeValueSource::FromAttribute { .. }))
+}
+
 pub struct InsertTransform {
-    pub(super) entries: BTreeMap<String, LiteralValue>,
+    pub(super) entries: BTreeMap<String, AttributeValueSource>,
 }
 
 impl InsertTransform {
     #[must_use]
-    pub const fn new(entries: BTreeMap<String, LiteralValue>) -> Self {
+    pub fn new(entries: BTreeMap<String, LiteralValue>) -> Self {
+        Self {
+            entries: literal_entries(entries),
+        }
+    }
+
+    /// Build an insert transform whose values may be sourced from other attributes.
+    #[must_use]
+    pub const fn with_sources(entries: BTreeMap<String, AttributeValueSource>) -> Self {
         Self { entries }
     }
 
@@ -739,12 +785,20 @@ impl InsertTransform {
 /// An upsert transform inserts a new attribute if the key doesn't exist for a given parent,
 /// or updates the existing attribute's value if the key already exists.
 pub struct UpsertTransform {
-    pub(super) entries: BTreeMap<String, LiteralValue>,
+    pub(super) entries: BTreeMap<String, AttributeValueSource>,
 }
 
 impl UpsertTransform {
     #[must_use]
     pub fn new(entries: BTreeMap<String, LiteralValue>) -> Self {
+        Self {
+            entries: literal_entries(entries),
+        }
+    }
+
+    /// Build an upsert transform whose values may be sourced from other attributes.
+    #[must_use]
+    pub const fn with_sources(entries: BTreeMap<String, AttributeValueSource>) -> Self {
         Self { entries }
     }
 
@@ -925,6 +979,17 @@ impl AttributesTransform {
             .unwrap_or_default();
 
         does_inserts || does_upserts
+    }
+
+    /// Whether any value must be resolved from another payload before the transform can run.
+    fn has_attribute_sources(&self) -> bool {
+        self.insert
+            .as_ref()
+            .is_some_and(|i| has_source_entries(&i.entries))
+            || self
+                .upsert
+                .as_ref()
+                .is_some_and(|u| has_source_entries(&u.entries))
     }
 
     /// Validates the attribute transform operation. The current rule is that no key can be
@@ -1187,9 +1252,16 @@ pub fn apply_attribute_transform(
     }
 
     let stats = if let Some(attrs_record_batch) = attrs_record_batch {
+        let resolved = resolve_transform_sources(otap_batch, parent_payload_type, transform)?;
+
         // apply the transformation
-        let (new_attrs_record_batch, stats) =
-            transform_attributes_impl(attrs_record_batch, &id_column, transform, compute_stats)?;
+        let (new_attrs_record_batch, stats) = transform_attributes_resolved(
+            attrs_record_batch,
+            &id_column,
+            transform,
+            compute_stats,
+            &resolved,
+        )?;
 
         if new_attrs_record_batch.num_rows() > 0 {
             // replace the attribute record batch
@@ -1354,6 +1426,62 @@ pub fn transform_attributes_impl(
     id_column: &ArrayRef,
     transform: &AttributesTransform,
     compute_stats: bool,
+) -> Result<(RecordBatch, TransformStats)> {
+    if transform.has_attribute_sources() {
+        return Err(Error::InvalidAttributeTransform {
+            reason: "values sourced from other attributes require apply_attribute_transform, \
+                     which has access to the whole OTAP batch"
+                .into(),
+        });
+    }
+
+    transform_attributes_resolved(
+        attrs_record_batch,
+        id_column,
+        transform,
+        compute_stats,
+        &BTreeMap::new(),
+    )
+}
+
+/// Resolves every `FromAttribute` value in `transform` into an array aligned with the
+/// rows of `parent_payload_type`, keyed by the attribute key being written.
+fn resolve_transform_sources(
+    otap_batch: &OtapArrowRecords,
+    parent_payload_type: ArrowPayloadType,
+    transform: &AttributesTransform,
+) -> Result<BTreeMap<String, ArrayRef>> {
+    let mut resolved = BTreeMap::new();
+    if !transform.has_attribute_sources() {
+        return Ok(resolved);
+    }
+
+    let entries = transform
+        .insert
+        .iter()
+        .flat_map(|i| i.entries.iter())
+        .chain(transform.upsert.iter().flat_map(|u| u.entries.iter()));
+
+    for (attrs_key, value) in entries {
+        let AttributeValueSource::FromAttribute { scope, key } = value else {
+            continue;
+        };
+        if let Some(values) =
+            resolve_source_values(otap_batch, parent_payload_type, *scope, key.as_str())?
+        {
+            let _ = resolved.insert(attrs_key.clone(), values);
+        }
+    }
+
+    Ok(resolved)
+}
+
+fn transform_attributes_resolved(
+    attrs_record_batch: &RecordBatch,
+    id_column: &ArrayRef,
+    transform: &AttributesTransform,
+    compute_stats: bool,
+    resolved: &BTreeMap<String, ArrayRef>,
 ) -> Result<(RecordBatch, TransformStats)> {
     transform.validate()?;
 
@@ -1689,6 +1817,7 @@ pub fn transform_attributes_impl(
                 id_column,
                 rb,
                 &mut stats,
+                resolved,
             )?
         } else {
             apply_inserts_upserts_and_updates::<UInt32Type>(
@@ -1699,6 +1828,7 @@ pub fn transform_attributes_impl(
                 id_column,
                 rb,
                 &mut stats,
+                resolved,
             )?
         }
     }
@@ -3624,6 +3754,7 @@ fn apply_inserts_upserts_and_updates<T: ArrowPrimitiveType>(
     id_column: &ArrayRef,
     attrs_record_batch: RecordBatch,
     stats: &mut TransformStats,
+    resolved: &BTreeMap<String, ArrayRef>,
 ) -> Result<RecordBatch> {
     let num_inserts = insert_transform
         .as_ref()
@@ -3651,8 +3782,23 @@ fn apply_inserts_upserts_and_updates<T: ArrowPrimitiveType>(
 
     let mut existing_id_set = IdBitmap::new();
 
+    let row_by_parent_id = if resolved.is_empty() {
+        HashMap::new()
+    } else {
+        index_rows_by_id(id_column)?
+    };
+
     if let Some(inserts) = insert_transform {
-        for (attrs_key, insert_literal) in &inserts.entries {
+        for (attrs_key, insert_value) in &inserts.entries {
+            let source_values = match insert_value {
+                AttributeValueSource::Literal(_) => None,
+                // An unresolved source has no value to insert anywhere.
+                AttributeValueSource::FromAttribute { .. } => match resolved.get(attrs_key) {
+                    Some(values) => Some(values),
+                    None => continue,
+                },
+            };
+
             let existing_key_mask =
                 eq(&key_column, &StringArray::new_scalar(attrs_key)).map_err(|_| {
                     Error::UnsupportedStringColumnType {
@@ -3665,9 +3811,19 @@ fn apply_inserts_upserts_and_updates<T: ArrowPrimitiveType>(
 
             let mut parent_ids =
                 Vec::with_capacity((parent_id_set.len() - existing_id_set.len()) as usize);
+            let mut value_rows = Vec::new();
             for id in parent_id_set.iter() {
                 if existing_id_set.contains(id) {
                     continue;
+                }
+                if let Some(values) = source_values {
+                    let Some(row) = row_by_parent_id.get(&id).copied() else {
+                        continue;
+                    };
+                    if values.is_null(row) {
+                        continue;
+                    }
+                    value_rows.push(row as u32);
                 }
                 // safety: we're converting a value that would have been one of the existing IDs
                 // into the type of the ID, which means this value can fit so this shouldn't error
@@ -3684,20 +3840,45 @@ fn apply_inserts_upserts_and_updates<T: ArrowPrimitiveType>(
                     BooleanBuffer::new_unset(existing_key_mask.len()),
                     None,
                 ),
-                new_values: ColumnarValue::Scalar(insert_literal.into()),
+                new_values: match (insert_value, source_values) {
+                    (AttributeValueSource::Literal(literal), _) => {
+                        ColumnarValue::Scalar(literal.into())
+                    }
+                    (_, Some(values)) => ColumnarValue::Array(take_rows(values, &value_rows)?),
+                    // safety: a non-literal source without resolved values was skipped above
+                    (_, None) => unreachable!("unresolved source is skipped"),
+                },
                 upsert_parent_ids: PrimitiveArray::<T>::from_iter_values(parent_ids),
             })
         }
     }
 
     if let Some(upserts) = upsert_transform {
-        for (attrs_key, upsert_literal) in &upserts.entries {
-            let existing_key_mask =
-                eq(&key_column, &StringArray::new_scalar(attrs_key)).map_err(|_| {
-                    Error::UnsupportedStringColumnType {
-                        data_type: key_column.data_type().clone(),
-                    }
+        for (attrs_key, upsert_value) in &upserts.entries {
+            let source_values = match upsert_value {
+                AttributeValueSource::Literal(_) => None,
+                AttributeValueSource::FromAttribute { .. } => match resolved.get(attrs_key) {
+                    Some(values) => Some(values),
+                    None => continue,
+                },
+            };
+
+            let mut existing_key_mask = eq(&key_column, &StringArray::new_scalar(attrs_key))
+                .map_err(|_| Error::UnsupportedStringColumnType {
+                    data_type: key_column.data_type().clone(),
                 })?;
+            let mut value_rows = Vec::new();
+            if let Some(values) = source_values {
+                let (mask, update_rows) = restrict_mask_to_resolved(
+                    &existing_key_mask,
+                    parent_ids_col,
+                    &row_by_parent_id,
+                    values,
+                )?;
+                existing_key_mask = mask;
+                value_rows = update_rows;
+            }
+
             let existing_parent_ids = filter(&parent_ids_col, &existing_key_mask)
                 .map_err(|e| Error::ColumnLengthMismatch { source: e })?;
             populate_parent_id_set(&mut existing_id_set, &existing_parent_ids)?;
@@ -3707,6 +3888,15 @@ fn apply_inserts_upserts_and_updates<T: ArrowPrimitiveType>(
             for id in parent_id_set.iter() {
                 if existing_id_set.contains(id) {
                     continue;
+                }
+                if let Some(values) = source_values {
+                    let Some(row) = row_by_parent_id.get(&id).copied() else {
+                        continue;
+                    };
+                    if values.is_null(row) {
+                        continue;
+                    }
+                    value_rows.push(row as u32);
                 }
                 // safety: we're converting a value that would have been one of the existing IDs
                 // into the type of the ID, which means this value can fit so this shouldn't error
@@ -3720,7 +3910,14 @@ fn apply_inserts_upserts_and_updates<T: ArrowPrimitiveType>(
             attr_upsert_args.push(AttributeUpsert {
                 attrs_key,
                 existing_key_mask,
-                new_values: ColumnarValue::Scalar(upsert_literal.into()),
+                new_values: match (upsert_value, source_values) {
+                    (AttributeValueSource::Literal(literal), _) => {
+                        ColumnarValue::Scalar(literal.into())
+                    }
+                    (_, Some(values)) => ColumnarValue::Array(take_rows(values, &value_rows)?),
+                    // safety: a non-literal source without resolved values was skipped above
+                    (_, None) => unreachable!("unresolved source is skipped"),
+                },
                 upsert_parent_ids: PrimitiveArray::<T>::from_iter_values(parent_ids),
             })
         }
@@ -3970,6 +4167,68 @@ fn append_sha256_hex_lower(builder: &mut StringBuilder, bytes: &[u8]) {
 
 /// push the values from the array into the vec. Returns an error if the passed array
 /// does not contain values of this primitive type
+/// Maps each parent id to the row of the parent batch it identifies.
+fn index_rows_by_id(id_column: &ArrayRef) -> Result<HashMap<u32, usize>> {
+    Ok(ids_as_u32(id_column)?
+        .iter()
+        .enumerate()
+        .filter_map(|(row, id)| id.map(|id| (id, row)))
+        .collect())
+}
+
+fn ids_as_u32(id_column: &ArrayRef) -> Result<Vec<Option<u32>>> {
+    let ids = cast(id_column, &DataType::UInt32).map_err(|_| Error::InvalidIdColumnType {
+        data_type: id_column.data_type().clone(),
+    })?;
+    let ids = ids
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        // safety: we have just cast to UInt32
+        .expect("can downcast to u32");
+
+    Ok(ids.iter().collect())
+}
+
+fn take_rows(values: &ArrayRef, rows: &[u32]) -> Result<ArrayRef> {
+    take(values, &UInt32Array::from(rows.to_vec()), None)
+        .map_err(|e| Error::ColumnLengthMismatch { source: e })
+}
+
+/// Narrows an update mask to the rows whose parent has a resolved value, and returns the
+/// parent batch rows those updates read from, in mask order.
+///
+/// Rows dropped from the mask keep whatever value they already had, which is what makes a
+/// sourced upsert a no-op where the source attribute is missing.
+fn restrict_mask_to_resolved(
+    existing_key_mask: &BooleanArray,
+    parent_ids_col: &ArrayRef,
+    row_by_parent_id: &HashMap<u32, usize>,
+    values: &ArrayRef,
+) -> Result<(BooleanArray, Vec<u32>)> {
+    let parent_ids = ids_as_u32(parent_ids_col)?;
+    let mut mask = BooleanBufferBuilder::new(existing_key_mask.len());
+    let mut value_rows = Vec::new();
+
+    for (row, parent_id) in parent_ids.iter().enumerate() {
+        let resolved_row = existing_key_mask
+            .value(row)
+            .then_some(*parent_id)
+            .flatten()
+            .and_then(|parent_id| row_by_parent_id.get(&parent_id).copied())
+            .filter(|resolved_row| !values.is_null(*resolved_row));
+
+        match resolved_row {
+            Some(resolved_row) => {
+                mask.append(true);
+                value_rows.push(resolved_row as u32);
+            }
+            None => mask.append(false),
+        }
+    }
+
+    Ok((BooleanArray::new(mask.finish(), None), value_rows))
+}
+
 fn populate_parent_id_vec<T: ArrowPrimitiveType>(
     parent_id_vec: &mut Vec<T::Native>,
     id_column: &ArrayRef,
