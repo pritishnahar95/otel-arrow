@@ -312,8 +312,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::otap::transform::{
-        AttributeValueSource, AttributesTransform, InsertTransform, UpsertTransform,
-        apply_attribute_transform,
+        AttributeAssignment, AttributeCondition, AttributeValueSource, AttributesTransform,
+        InsertTransform, LiteralValue, UpsertTransform, apply_attribute_transform,
     };
     use crate::proto::OtlpProtoMessage;
     use crate::proto::opentelemetry::common::v1::{AnyValue, InstrumentationScope, KeyValue};
@@ -601,5 +601,154 @@ mod tests {
                 Some(AnyValue::new_string("/subscriptions/x"))
             );
         }
+    }
+
+    /// Scenario: A conditional insert copies `node.id` only where `node.type` is `receiver`.
+    /// Guarantees: Records under a non-matching scope are untouched, which is the guard the
+    /// OTTL config expresses with `where instrumentation_scope.attributes["node.type"] == ...`.
+    #[test]
+    fn a_condition_restricts_the_insert_to_matching_records() {
+        let transform = || {
+            AttributesTransform::default().with_insert(InsertTransform::with_assignments(
+                [(
+                    "componentName".to_owned(),
+                    AttributeAssignment::when(
+                        AttributeValueSource::FromAttribute {
+                            scope: AttributeSourceScope::Scope,
+                            key: "node.id".to_owned(),
+                        },
+                        AttributeCondition {
+                            scope: AttributeSourceScope::Scope,
+                            key: "node.type".to_owned(),
+                            equals: LiteralValue::Str("receiver".to_owned()),
+                        },
+                    ),
+                )]
+                .into(),
+            ))
+        };
+
+        let mut matching = logs(
+            vec![],
+            vec![
+                KeyValue::new("node.id", AnyValue::new_string("otlp-in")),
+                KeyValue::new("node.type", AnyValue::new_string("receiver")),
+            ],
+            vec![LogRecord::build().event_name("a").finish()],
+        );
+        let _ = apply_attribute_transform(
+            &mut matching,
+            ArrowPayloadType::LogAttrs,
+            &transform(),
+            false,
+        )
+        .expect("transform");
+        assert_eq!(
+            value_of(&log_attributes(&matching)[0], "componentName"),
+            Some(AnyValue::new_string("otlp-in"))
+        );
+
+        let mut non_matching = logs(
+            vec![],
+            vec![
+                KeyValue::new("node.id", AnyValue::new_string("batch")),
+                KeyValue::new("node.type", AnyValue::new_string("processor")),
+            ],
+            vec![LogRecord::build().event_name("a").finish()],
+        );
+        let _ = apply_attribute_transform(
+            &mut non_matching,
+            ArrowPayloadType::LogAttrs,
+            &transform(),
+            false,
+        )
+        .expect("transform");
+        assert_eq!(
+            value_of(&log_attributes(&non_matching)[0], "componentName"),
+            None
+        );
+    }
+
+    /// Scenario: A conditional upsert would overwrite an attribute the records already carry.
+    /// Guarantees: The existing value survives where the condition fails, so a conditional
+    /// upsert is a no-op rather than a blanket overwrite.
+    #[test]
+    fn a_failing_condition_leaves_an_existing_value_alone() {
+        let mut otap_batch = logs(
+            vec![],
+            vec![KeyValue::new("node.type", AnyValue::new_string("exporter"))],
+            vec![
+                LogRecord::build()
+                    .event_name("a")
+                    .attributes(vec![KeyValue::new(
+                        "componentName",
+                        AnyValue::new_string("original"),
+                    )])
+                    .finish(),
+            ],
+        );
+
+        let _ = apply_attribute_transform(
+            &mut otap_batch,
+            ArrowPayloadType::LogAttrs,
+            &AttributesTransform::default().with_upsert(UpsertTransform::with_assignments(
+                [(
+                    "componentName".to_owned(),
+                    AttributeAssignment::when(
+                        AttributeValueSource::Literal(LiteralValue::Str("replaced".to_owned())),
+                        AttributeCondition {
+                            scope: AttributeSourceScope::Scope,
+                            key: "node.type".to_owned(),
+                            equals: LiteralValue::Str("receiver".to_owned()),
+                        },
+                    ),
+                )]
+                .into(),
+            )),
+            false,
+        )
+        .expect("transform");
+
+        assert_eq!(
+            value_of(&log_attributes(&otap_batch)[0], "componentName"),
+            Some(AnyValue::new_string("original"))
+        );
+    }
+
+    /// Scenario: A condition tests an attribute that does not exist anywhere in the batch.
+    /// Guarantees: The action is skipped entirely rather than treated as vacuously true.
+    #[test]
+    fn a_condition_on_a_missing_attribute_never_holds() {
+        let mut otap_batch = logs(
+            vec![],
+            vec![],
+            vec![LogRecord::build().event_name("a").finish()],
+        );
+
+        let _ = apply_attribute_transform(
+            &mut otap_batch,
+            ArrowPayloadType::LogAttrs,
+            &AttributesTransform::default().with_insert(InsertTransform::with_assignments(
+                [(
+                    "componentName".to_owned(),
+                    AttributeAssignment::when(
+                        AttributeValueSource::Literal(LiteralValue::Str("x".to_owned())),
+                        AttributeCondition {
+                            scope: AttributeSourceScope::Scope,
+                            key: "node.type".to_owned(),
+                            equals: LiteralValue::Str("receiver".to_owned()),
+                        },
+                    ),
+                )]
+                .into(),
+            )),
+            false,
+        )
+        .expect("transform");
+
+        assert_eq!(
+            value_of(&log_attributes(&otap_batch)[0], "componentName"),
+            None
+        );
     }
 }

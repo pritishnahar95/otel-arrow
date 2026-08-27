@@ -101,6 +101,27 @@ actions:
 
 Records whose referenced attribute is missing are left untouched.
 
+`insert` and `upsert` also take an optional `condition` that restricts the
+action to the records where another attribute equals a given value. It names the
+attribute the same way a `from_attribute` reference does, plus the value to
+compare against:
+
+```yaml
+actions:
+  - action: insert
+    key: componentName
+    from_attribute:
+      scope: scope
+      key: node.id
+    condition:
+      scope: scope
+      key: node.type
+      equals: receiver
+```
+
+Records where the condition does not hold are left untouched, including records
+whose tested attribute is missing.
+
 Actions of one kind compose into a single map keyed by attribute key, so two
 `insert` actions (or two `upsert` actions) may not target the same key.
 

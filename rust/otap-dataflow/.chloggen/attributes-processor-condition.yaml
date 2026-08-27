@@ -1,0 +1,12 @@
+change_type: enhancement
+
+component: pipeline
+
+note: The attribute processor's insert and upsert actions accept an optional condition.
+
+issues: []
+
+subtext: |
+  A condition names an attribute the same way `from_attribute` does, plus the value it must equal
+  for the action to apply. Records where the condition does not hold, including records whose
+  tested attribute is missing, are left untouched.

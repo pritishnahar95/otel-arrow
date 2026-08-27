@@ -9,8 +9,9 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, ArrowNativeTypeOp, ArrowPrimitiveType, BooleanArray, BooleanBufferBuilder,
-    DictionaryArray, MutableArrayData, PrimitiveArray, PrimitiveBuilder, RecordBatch, StringArray,
-    StringBuilder, StructArray, UInt16Array, UInt32Array, make_array,
+    DictionaryArray, Float64Array, Int64Array, LargeStringArray, MutableArrayData, PrimitiveArray,
+    PrimitiveBuilder, RecordBatch, StringArray, StringBuilder, StructArray, UInt16Array,
+    UInt32Array, make_array,
 };
 use arrow::buffer::{BooleanBuffer, Buffer, MutableBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::compute::kernels::cmp::{eq, gt_eq, lt};
@@ -745,21 +746,77 @@ impl From<LiteralValue> for AttributeValueSource {
 
 fn literal_entries(
     entries: BTreeMap<String, LiteralValue>,
-) -> BTreeMap<String, AttributeValueSource> {
+) -> BTreeMap<String, AttributeAssignment> {
     entries
         .into_iter()
-        .map(|(key, value)| (key, value.into()))
+        .map(|(key, value)| (key, AttributeAssignment::new(value.into())))
         .collect()
 }
 
-fn has_source_entries(entries: &BTreeMap<String, AttributeValueSource>) -> bool {
+fn source_entries(
+    entries: BTreeMap<String, AttributeValueSource>,
+) -> BTreeMap<String, AttributeAssignment> {
     entries
-        .values()
-        .any(|value| matches!(value, AttributeValueSource::FromAttribute { .. }))
+        .into_iter()
+        .map(|(key, value)| (key, AttributeAssignment::new(value)))
+        .collect()
+}
+
+fn needs_whole_batch(entries: &BTreeMap<String, AttributeAssignment>) -> bool {
+    entries.values().any(AttributeAssignment::needs_whole_batch)
+}
+
+/// A predicate restricting an insert or upsert to the records where it holds.
+///
+/// Deliberately limited to comparing one attribute against one literal. Anything richer belongs
+/// in a transform language rather than here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttributeCondition {
+    /// The payload the tested attribute is read from, relative to the record being written.
+    pub scope: AttributeSourceScope,
+    /// The key to test.
+    pub key: String,
+    /// The value the attribute must equal for the action to apply.
+    pub equals: LiteralValue,
+}
+
+/// A value to write, and the condition under which it is written.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttributeAssignment {
+    /// Where the written value comes from.
+    pub value: AttributeValueSource,
+    /// Restricts the assignment to the records where the condition holds.
+    pub condition: Option<AttributeCondition>,
+}
+
+impl AttributeAssignment {
+    /// An assignment that applies to every record.
+    #[must_use]
+    pub const fn new(value: AttributeValueSource) -> Self {
+        Self {
+            value,
+            condition: None,
+        }
+    }
+
+    /// An assignment that applies only where `condition` holds.
+    #[must_use]
+    pub const fn when(value: AttributeValueSource, condition: AttributeCondition) -> Self {
+        Self {
+            value,
+            condition: Some(condition),
+        }
+    }
+
+    /// Whether resolving this assignment needs payloads beyond the attributes batch itself.
+    #[must_use]
+    pub const fn needs_whole_batch(&self) -> bool {
+        self.condition.is_some() || matches!(self.value, AttributeValueSource::FromAttribute { .. })
+    }
 }
 
 pub struct InsertTransform {
-    pub(super) entries: BTreeMap<String, AttributeValueSource>,
+    pub(super) entries: BTreeMap<String, AttributeAssignment>,
 }
 
 impl InsertTransform {
@@ -772,7 +829,15 @@ impl InsertTransform {
 
     /// Build an insert transform whose values may be sourced from other attributes.
     #[must_use]
-    pub const fn with_sources(entries: BTreeMap<String, AttributeValueSource>) -> Self {
+    pub fn with_sources(entries: BTreeMap<String, AttributeValueSource>) -> Self {
+        Self {
+            entries: source_entries(entries),
+        }
+    }
+
+    /// Build an insert transform whose entries may be sourced and conditional.
+    #[must_use]
+    pub const fn with_assignments(entries: BTreeMap<String, AttributeAssignment>) -> Self {
         Self { entries }
     }
 
@@ -785,7 +850,7 @@ impl InsertTransform {
 /// An upsert transform inserts a new attribute if the key doesn't exist for a given parent,
 /// or updates the existing attribute's value if the key already exists.
 pub struct UpsertTransform {
-    pub(super) entries: BTreeMap<String, AttributeValueSource>,
+    pub(super) entries: BTreeMap<String, AttributeAssignment>,
 }
 
 impl UpsertTransform {
@@ -798,7 +863,15 @@ impl UpsertTransform {
 
     /// Build an upsert transform whose values may be sourced from other attributes.
     #[must_use]
-    pub const fn with_sources(entries: BTreeMap<String, AttributeValueSource>) -> Self {
+    pub fn with_sources(entries: BTreeMap<String, AttributeValueSource>) -> Self {
+        Self {
+            entries: source_entries(entries),
+        }
+    }
+
+    /// Build an upsert transform whose entries may be sourced and conditional.
+    #[must_use]
+    pub const fn with_assignments(entries: BTreeMap<String, AttributeAssignment>) -> Self {
         Self { entries }
     }
 
@@ -985,11 +1058,11 @@ impl AttributesTransform {
     fn has_attribute_sources(&self) -> bool {
         self.insert
             .as_ref()
-            .is_some_and(|i| has_source_entries(&i.entries))
+            .is_some_and(|i| needs_whole_batch(&i.entries))
             || self
                 .upsert
                 .as_ref()
-                .is_some_and(|u| has_source_entries(&u.entries))
+                .is_some_and(|u| needs_whole_batch(&u.entries))
     }
 
     /// Validates the attribute transform operation. The current rule is that no key can be
@@ -1429,8 +1502,8 @@ pub fn transform_attributes_impl(
 ) -> Result<(RecordBatch, TransformStats)> {
     if transform.has_attribute_sources() {
         return Err(Error::InvalidAttributeTransform {
-            reason: "values sourced from other attributes require apply_attribute_transform, \
-                     which has access to the whole OTAP batch"
+            reason: "values sourced from other attributes, and conditional assignments, require \
+                     apply_attribute_transform, which has access to the whole OTAP batch"
                 .into(),
         });
     }
@@ -1440,18 +1513,31 @@ pub fn transform_attributes_impl(
         id_column,
         transform,
         compute_stats,
-        &BTreeMap::new(),
+        &ResolvedSources::default(),
     )
 }
 
-/// Resolves every `FromAttribute` value in `transform` into an array aligned with the
-/// rows of `parent_payload_type`, keyed by the attribute key being written.
+/// Values and condition outcomes resolved against the whole OTAP batch, each aligned with the
+/// rows of the parent payload and keyed by the attribute key being written.
+#[derive(Default)]
+struct ResolvedSources {
+    values: BTreeMap<String, ArrayRef>,
+    conditions: BTreeMap<String, BooleanArray>,
+}
+
+impl ResolvedSources {
+    fn is_empty(&self) -> bool {
+        self.values.is_empty() && self.conditions.is_empty()
+    }
+}
+
+/// Resolves every sourced value and every condition in `transform` against the whole batch.
 fn resolve_transform_sources(
     otap_batch: &OtapArrowRecords,
     parent_payload_type: ArrowPayloadType,
     transform: &AttributesTransform,
-) -> Result<BTreeMap<String, ArrayRef>> {
-    let mut resolved = BTreeMap::new();
+) -> Result<ResolvedSources> {
+    let mut resolved = ResolvedSources::default();
     if !transform.has_attribute_sources() {
         return Ok(resolved);
     }
@@ -1462,18 +1548,69 @@ fn resolve_transform_sources(
         .flat_map(|i| i.entries.iter())
         .chain(transform.upsert.iter().flat_map(|u| u.entries.iter()));
 
-    for (attrs_key, value) in entries {
-        let AttributeValueSource::FromAttribute { scope, key } = value else {
-            continue;
-        };
-        if let Some(values) =
-            resolve_source_values(otap_batch, parent_payload_type, *scope, key.as_str())?
+    for (attrs_key, assignment) in entries {
+        if let AttributeValueSource::FromAttribute { scope, key } = &assignment.value
+            && let Some(values) =
+                resolve_source_values(otap_batch, parent_payload_type, *scope, key.as_str())?
         {
-            let _ = resolved.insert(attrs_key.clone(), values);
+            let _ = resolved.values.insert(attrs_key.clone(), values);
+        }
+
+        if let Some(condition) = &assignment.condition
+            && let Some(holds) = evaluate_condition(otap_batch, parent_payload_type, condition)?
+        {
+            let _ = resolved.conditions.insert(attrs_key.clone(), holds);
         }
     }
 
     Ok(resolved)
+}
+
+/// Evaluates `condition` for every row of `parent_payload_type`.
+///
+/// Returns `None` when the condition cannot hold anywhere, either because the tested attribute is
+/// unreachable or because its type cannot compare equal to the literal.
+fn evaluate_condition(
+    otap_batch: &OtapArrowRecords,
+    parent_payload_type: ArrowPayloadType,
+    condition: &AttributeCondition,
+) -> Result<Option<BooleanArray>> {
+    let Some(values) = resolve_source_values(
+        otap_batch,
+        parent_payload_type,
+        condition.scope,
+        condition.key.as_str(),
+    )?
+    else {
+        return Ok(None);
+    };
+
+    let compared = match (values.data_type(), &condition.equals) {
+        (DataType::Utf8, LiteralValue::Str(expected)) => {
+            eq(&values, &StringArray::new_scalar(expected))
+        }
+        (DataType::LargeUtf8, LiteralValue::Str(expected)) => {
+            eq(&values, &LargeStringArray::new_scalar(expected))
+        }
+        (DataType::Boolean, LiteralValue::Bool(expected)) => {
+            eq(&values, &BooleanArray::new_scalar(*expected))
+        }
+        (DataType::Int64, LiteralValue::Int(expected)) => {
+            eq(&values, &Int64Array::new_scalar(*expected))
+        }
+        (DataType::Float64, LiteralValue::Double(expected)) => {
+            eq(&values, &Float64Array::new_scalar(*expected))
+        }
+        // A value of a different type never equals the literal.
+        _ => return Ok(None),
+    }
+    .map_err(|e| Error::ColumnLengthMismatch { source: e })?;
+
+    // A record without the attribute compares null; treat that as not holding.
+    Ok(Some(match compared.nulls() {
+        Some(nulls) => BooleanArray::new(compared.values() & nulls.inner(), None),
+        None => compared,
+    }))
 }
 
 fn transform_attributes_resolved(
@@ -1481,7 +1618,7 @@ fn transform_attributes_resolved(
     id_column: &ArrayRef,
     transform: &AttributesTransform,
     compute_stats: bool,
-    resolved: &BTreeMap<String, ArrayRef>,
+    resolved: &ResolvedSources,
 ) -> Result<(RecordBatch, TransformStats)> {
     transform.validate()?;
 
@@ -3754,7 +3891,7 @@ fn apply_inserts_upserts_and_updates<T: ArrowPrimitiveType>(
     id_column: &ArrayRef,
     attrs_record_batch: RecordBatch,
     stats: &mut TransformStats,
-    resolved: &BTreeMap<String, ArrayRef>,
+    resolved: &ResolvedSources,
 ) -> Result<RecordBatch> {
     let num_inserts = insert_transform
         .as_ref()
@@ -3789,12 +3926,22 @@ fn apply_inserts_upserts_and_updates<T: ArrowPrimitiveType>(
     };
 
     if let Some(inserts) = insert_transform {
-        for (attrs_key, insert_value) in &inserts.entries {
-            let source_values = match insert_value {
+        for (attrs_key, assignment) in &inserts.entries {
+            let source_values = match &assignment.value {
                 AttributeValueSource::Literal(_) => None,
                 // An unresolved source has no value to insert anywhere.
-                AttributeValueSource::FromAttribute { .. } => match resolved.get(attrs_key) {
-                    Some(values) => Some(values),
+                AttributeValueSource::FromAttribute { .. } => {
+                    match resolved.values.get(attrs_key) {
+                        Some(values) => Some(values),
+                        None => continue,
+                    }
+                }
+            };
+            // A condition that cannot hold anywhere leaves the action with nothing to do.
+            let condition = match &assignment.condition {
+                None => None,
+                Some(_) => match resolved.conditions.get(attrs_key) {
+                    Some(holds) => Some(holds),
                     None => continue,
                 },
             };
@@ -3814,6 +3961,9 @@ fn apply_inserts_upserts_and_updates<T: ArrowPrimitiveType>(
             let mut value_rows = Vec::new();
             for id in parent_id_set.iter() {
                 if existing_id_set.contains(id) {
+                    continue;
+                }
+                if !condition_holds(condition, &row_by_parent_id, id) {
                     continue;
                 }
                 if let Some(values) = source_values {
@@ -3840,7 +3990,7 @@ fn apply_inserts_upserts_and_updates<T: ArrowPrimitiveType>(
                     BooleanBuffer::new_unset(existing_key_mask.len()),
                     None,
                 ),
-                new_values: match (insert_value, source_values) {
+                new_values: match (&assignment.value, source_values) {
                     (AttributeValueSource::Literal(literal), _) => {
                         ColumnarValue::Scalar(literal.into())
                     }
@@ -3854,11 +4004,20 @@ fn apply_inserts_upserts_and_updates<T: ArrowPrimitiveType>(
     }
 
     if let Some(upserts) = upsert_transform {
-        for (attrs_key, upsert_value) in &upserts.entries {
-            let source_values = match upsert_value {
+        for (attrs_key, assignment) in &upserts.entries {
+            let source_values = match &assignment.value {
                 AttributeValueSource::Literal(_) => None,
-                AttributeValueSource::FromAttribute { .. } => match resolved.get(attrs_key) {
-                    Some(values) => Some(values),
+                AttributeValueSource::FromAttribute { .. } => {
+                    match resolved.values.get(attrs_key) {
+                        Some(values) => Some(values),
+                        None => continue,
+                    }
+                }
+            };
+            let condition = match &assignment.condition {
+                None => None,
+                Some(_) => match resolved.conditions.get(attrs_key) {
+                    Some(holds) => Some(holds),
                     None => continue,
                 },
             };
@@ -3868,12 +4027,13 @@ fn apply_inserts_upserts_and_updates<T: ArrowPrimitiveType>(
                     data_type: key_column.data_type().clone(),
                 })?;
             let mut value_rows = Vec::new();
-            if let Some(values) = source_values {
-                let (mask, update_rows) = restrict_mask_to_resolved(
+            if source_values.is_some() || condition.is_some() {
+                let (mask, update_rows) = restrict_mask(
                     &existing_key_mask,
                     parent_ids_col,
                     &row_by_parent_id,
-                    values,
+                    source_values,
+                    condition,
                 )?;
                 existing_key_mask = mask;
                 value_rows = update_rows;
@@ -3887,6 +4047,9 @@ fn apply_inserts_upserts_and_updates<T: ArrowPrimitiveType>(
             populate_parent_id_vec::<T>(&mut parent_ids, &existing_parent_ids)?;
             for id in parent_id_set.iter() {
                 if existing_id_set.contains(id) {
+                    continue;
+                }
+                if !condition_holds(condition, &row_by_parent_id, id) {
                     continue;
                 }
                 if let Some(values) = source_values {
@@ -3910,7 +4073,7 @@ fn apply_inserts_upserts_and_updates<T: ArrowPrimitiveType>(
             attr_upsert_args.push(AttributeUpsert {
                 attrs_key,
                 existing_key_mask,
-                new_values: match (upsert_value, source_values) {
+                new_values: match (&assignment.value, source_values) {
                     (AttributeValueSource::Literal(literal), _) => {
                         ColumnarValue::Scalar(literal.into())
                     }
@@ -4194,16 +4357,18 @@ fn take_rows(values: &ArrayRef, rows: &[u32]) -> Result<ArrayRef> {
         .map_err(|e| Error::ColumnLengthMismatch { source: e })
 }
 
-/// Narrows an update mask to the rows whose parent has a resolved value, and returns the
-/// parent batch rows those updates read from, in mask order.
+/// Narrows an update mask to the rows whose parent has a resolved value and satisfies the
+/// assignment's condition, and returns the parent batch rows those updates read from, in mask
+/// order.
 ///
 /// Rows dropped from the mask keep whatever value they already had, which is what makes a
-/// sourced upsert a no-op where the source attribute is missing.
-fn restrict_mask_to_resolved(
+/// sourced or conditional upsert a no-op where the source is missing or the condition fails.
+fn restrict_mask(
     existing_key_mask: &BooleanArray,
     parent_ids_col: &ArrayRef,
     row_by_parent_id: &HashMap<u32, usize>,
-    values: &ArrayRef,
+    values: Option<&ArrayRef>,
+    condition: Option<&BooleanArray>,
 ) -> Result<(BooleanArray, Vec<u32>)> {
     let parent_ids = ids_as_u32(parent_ids_col)?;
     let mut mask = BooleanBufferBuilder::new(existing_key_mask.len());
@@ -4215,18 +4380,36 @@ fn restrict_mask_to_resolved(
             .then_some(*parent_id)
             .flatten()
             .and_then(|parent_id| row_by_parent_id.get(&parent_id).copied())
-            .filter(|resolved_row| !values.is_null(*resolved_row));
+            .filter(|resolved_row| condition.is_none_or(|holds| holds.value(*resolved_row)))
+            .filter(|resolved_row| values.is_none_or(|values| !values.is_null(*resolved_row)));
 
         match resolved_row {
             Some(resolved_row) => {
                 mask.append(true);
-                value_rows.push(resolved_row as u32);
+                if values.is_some() {
+                    value_rows.push(resolved_row as u32);
+                }
             }
             None => mask.append(false),
         }
     }
 
     Ok((BooleanArray::new(mask.finish(), None), value_rows))
+}
+
+/// Whether a conditional assignment applies to the parent identified by `id`.
+fn condition_holds(
+    condition: Option<&BooleanArray>,
+    row_by_parent_id: &HashMap<u32, usize>,
+    id: u32,
+) -> bool {
+    let Some(condition) = condition else {
+        return true;
+    };
+    row_by_parent_id
+        .get(&id)
+        .copied()
+        .is_some_and(|row| condition.value(row))
 }
 
 fn populate_parent_id_vec<T: ArrowPrimitiveType>(

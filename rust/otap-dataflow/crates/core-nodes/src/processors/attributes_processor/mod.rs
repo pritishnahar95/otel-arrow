@@ -34,14 +34,19 @@
 //!
 //! `insert` and `upsert` take either a literal `value` or a `from_attribute` reference that
 //! copies the value of another attribute. The referenced attribute may live on the resource or
-//! scope the record belongs to, not just on the record itself:
+//! scope the record belongs to, not just on the record itself. An optional `condition` restricts
+//! the action to the records where another attribute equals a given value:
 //! ```yaml
 //! actions:
 //!   - action: "insert"
-//!     key: "instanceId"
+//!     key: "componentName"
 //!     from_attribute:
-//!       scope: "resource"           # resource, scope, or record
-//!       key: "service.instance.id"
+//!       scope: "scope"             # resource, scope, or record
+//!       key: "node.id"
+//!     condition:
+//!       scope: "scope"
+//!       key: "node.type"
+//!       equals: "receiver"
 //! ```
 //!
 //! Implementation uses otel_arrow_dfe_pdata::otap::transform::transform_attributes for
@@ -74,9 +79,9 @@ use otel_arrow_dfe_pdata::otap::transform::apply_attribute_transform;
 use otel_arrow_dfe_pdata::otap::{
     OtapArrowRecords,
     transform::{
-        AttributeValueSource, AttributesTransform, DeleteTransform, HashSpec, HashTransform,
-        InsertTransform, LiteralValue, RenameTransform, UpdateTransform, UpsertTransform,
-        attribute_source::AttributeSourceScope,
+        AttributeAssignment, AttributeCondition, AttributeValueSource, AttributesTransform,
+        DeleteTransform, HashSpec, HashTransform, InsertTransform, LiteralValue, RenameTransform,
+        UpdateTransform, UpsertTransform, attribute_source::AttributeSourceScope,
     },
 };
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
@@ -119,6 +124,9 @@ pub enum Action {
         /// The attribute to copy the value from. Mutually exclusive with `value`.
         #[serde(default)]
         from_attribute: Option<AttributeRef>,
+        /// Restricts the action to the records where the condition holds.
+        #[serde(default)]
+        condition: Option<Condition>,
     },
 
     /// Upsert an attribute: insert if key doesn't exist, or update value if it does.
@@ -131,6 +139,9 @@ pub enum Action {
         /// The attribute to copy the value from. Mutually exclusive with `value`.
         #[serde(default)]
         from_attribute: Option<AttributeRef>,
+        /// Restricts the action to the records where the condition holds.
+        #[serde(default)]
+        condition: Option<Condition>,
     },
 
     /// Update an existing attribute without inserting missing keys.
@@ -179,6 +190,20 @@ pub struct AttributeRef {
     pub key: String,
 }
 
+/// Restricts an action to the records where an attribute equals a given value.
+///
+/// Deliberately limited to a single equality test. Richer predicates belong in a transform
+/// language rather than in this processor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Condition {
+    /// Which attribute set to read the tested attribute from: `resource`, `scope`, or `record`.
+    pub scope: AttributeSourceScope,
+    /// The key to test.
+    pub key: String,
+    /// The value the attribute must equal for the action to apply.
+    pub equals: LiteralValue,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 /// Supported hash algorithms for the `hash` action.
@@ -187,30 +212,47 @@ pub enum HashAlgorithm {
     Sha256,
 }
 
-/// Turns the mutually exclusive `value` and `from_attribute` config fields into a value source.
-fn value_source(
+/// Turns the mutually exclusive `value` and `from_attribute` config fields into an assignment.
+fn assignment(
     action: &str,
     key: &str,
     value: Option<LiteralValue>,
     from_attribute: Option<AttributeRef>,
-) -> Result<AttributeValueSource, ConfigError> {
-    match (value, from_attribute) {
-        (Some(value), None) => Ok(AttributeValueSource::Literal(value)),
-        (None, Some(source)) => Ok(AttributeValueSource::FromAttribute {
+    condition: Option<Condition>,
+) -> Result<AttributeAssignment, ConfigError> {
+    let value = match (value, from_attribute) {
+        (Some(value), None) => AttributeValueSource::Literal(value),
+        (None, Some(source)) => AttributeValueSource::FromAttribute {
             scope: source.scope,
             key: source.key,
-        }),
-        (Some(_), Some(_)) => Err(ConfigError::InvalidUserConfig {
-            error: format!(
-                "{action} action for key '{key}' sets both 'value' and 'from_attribute'; set exactly one"
-            ),
-        }),
-        (None, None) => Err(ConfigError::InvalidUserConfig {
-            error: format!(
-                "{action} action for key '{key}' sets neither 'value' nor 'from_attribute'; set exactly one"
-            ),
-        }),
-    }
+        },
+        (Some(_), Some(_)) => {
+            return Err(ConfigError::InvalidUserConfig {
+                error: format!(
+                    "{action} action for key '{key}' sets both 'value' and 'from_attribute'; set exactly one"
+                ),
+            });
+        }
+        (None, None) => {
+            return Err(ConfigError::InvalidUserConfig {
+                error: format!(
+                    "{action} action for key '{key}' sets neither 'value' nor 'from_attribute'; set exactly one"
+                ),
+            });
+        }
+    };
+
+    Ok(match condition {
+        Some(condition) => AttributeAssignment::when(
+            value,
+            AttributeCondition {
+                scope: condition.scope,
+                key: condition.key,
+                equals: condition.equals,
+            },
+        ),
+        None => AttributeAssignment::new(value),
+    })
 }
 
 /// Actions of the same kind are composed into a single map keyed by attribute key, so two
@@ -308,9 +350,10 @@ impl AttributesProcessor {
                     key,
                     value,
                     from_attribute,
+                    condition,
                 } => {
-                    let source = value_source("insert", &key, value, from_attribute)?;
-                    if inserts.insert(key.clone(), source).is_some() {
+                    let entry = assignment("insert", &key, value, from_attribute, condition)?;
+                    if inserts.insert(key.clone(), entry).is_some() {
                         return Err(duplicate_key_error("insert", &key));
                     }
                 }
@@ -318,9 +361,10 @@ impl AttributesProcessor {
                     key,
                     value,
                     from_attribute,
+                    condition,
                 } => {
-                    let source = value_source("upsert", &key, value, from_attribute)?;
-                    if upserts.insert(key.clone(), source).is_some() {
+                    let entry = assignment("upsert", &key, value, from_attribute, condition)?;
+                    if upserts.insert(key.clone(), entry).is_some() {
                         return Err(duplicate_key_error("upsert", &key));
                     }
                 }
@@ -369,12 +413,12 @@ impl AttributesProcessor {
             insert: if inserts.is_empty() {
                 None
             } else {
-                Some(InsertTransform::with_sources(inserts))
+                Some(InsertTransform::with_assignments(inserts))
             },
             upsert: if upserts.is_empty() {
                 None
             } else {
-                Some(UpsertTransform::with_sources(upserts))
+                Some(UpsertTransform::with_assignments(upserts))
             },
             update: if updates.is_empty() {
                 None
@@ -854,6 +898,83 @@ mod tests {
         assert!(format!("{err}").contains("at most one"), "{err}");
     }
 
+    /// Scenario: A conditional insert copies `node.id` only where `node.type` is `receiver`.
+    /// Guarantees: The condition gates the action per record, so records under a non-matching
+    /// scope keep no `componentName` at all.
+    #[test]
+    fn test_condition_gates_the_insert_on_another_attribute() {
+        let cfg = json!({
+            "actions": [
+                {
+                    "action": "insert",
+                    "key": "componentName",
+                    "from_attribute": {"scope": "scope", "key": "node.id"},
+                    "condition": {"scope": "scope", "key": "node.type", "equals": "receiver"}
+                }
+            ]
+        });
+
+        let component_name_for = |node_type: &str| {
+            let input = build_logs_with_attrs(
+                vec![],
+                vec![
+                    KeyValue::new("node.id", AnyValue::new_string("otlp-in")),
+                    KeyValue::new("node.type", AnyValue::new_string(node_type)),
+                ],
+                vec![],
+            );
+
+            let rt: TestRuntime<OtapPdata> = TestRuntime::new();
+            let mut node_config = NodeUserConfig::new_processor_config(ATTRIBUTES_PROCESSOR_URN);
+            node_config.config = cfg.clone();
+            let proc = create_attributes_processor(
+                pipeline_ctx(),
+                test_node("attributes-processor-condition-test"),
+                Arc::new(node_config),
+                rt.config(),
+            )
+            .expect("create processor");
+            let phase = rt.set_processor(proc);
+
+            let found = Arc::new(std::sync::Mutex::new(None));
+            let captured = Arc::clone(&found);
+            phase
+                .run_test(move |mut ctx| async move {
+                    let mut bytes = BytesMut::new();
+                    input.encode(&mut bytes).expect("encode");
+                    let pdata_in = OtapPdata::new_default(
+                        OtlpProtoBytes::ExportLogsRequest(bytes.freeze()).into(),
+                    );
+                    ctx.process(Message::PData(pdata_in))
+                        .await
+                        .expect("process");
+
+                    let out = ctx.drain_pdata().await;
+                    let first = out.into_iter().next().expect("one output").payload();
+                    let otlp_bytes: OtlpProtoBytes =
+                        first.try_into_with_default().expect("convert to otlp");
+                    let OtlpProtoBytes::ExportLogsRequest(bytes) = otlp_bytes else {
+                        panic!("unexpected otlp variant")
+                    };
+                    let decoded = ExportLogsServiceRequest::decode(bytes.as_ref()).expect("decode");
+                    *captured.lock().expect("lock") = decoded.resource_logs[0].scope_logs[0]
+                        .log_records[0]
+                        .attributes
+                        .iter()
+                        .find(|kv| kv.key == "componentName")
+                        .and_then(|kv| kv.value.clone());
+                })
+                .validate(|_| async move {});
+
+            found.lock().expect("lock").clone()
+        };
+
+        assert_eq!(
+            component_name_for("receiver"),
+            Some(AnyValue::new_string("otlp-in"))
+        );
+        assert_eq!(component_name_for("processor"), None);
+    }
     #[test]
     fn test_config_from_json_parses_actions_and_apply_to_default() {
         let cfg = json!({
