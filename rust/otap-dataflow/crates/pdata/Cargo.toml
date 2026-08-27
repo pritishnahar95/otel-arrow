@@ -33,6 +33,7 @@ paste = { workspace = true }
 pretty_assertions = { workspace = true }
 prost = { workspace = true }
 rand = { workspace = true }
+regex = { workspace = true }
 roaring = { workspace = true }
 simdutf8 = { workspace = true }
 serde = { workspace = true }

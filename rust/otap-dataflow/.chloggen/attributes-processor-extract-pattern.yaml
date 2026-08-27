@@ -1,0 +1,9 @@
+change_type: enhancement
+
+component: pipeline
+
+note: The attributes processor can write a named capture group of a read attribute instead of the whole value
+
+issues: []
+
+subtext: A from_attribute reference accepts a pattern and the group to read from it, so one attribute can be split across several actions. Records whose value does not match are left untouched.

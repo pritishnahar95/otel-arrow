@@ -312,8 +312,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::otap::transform::{
-        AttributeAssignment, AttributeCondition, AttributeValueSource, AttributesTransform,
-        InsertTransform, LiteralValue, UpsertTransform, apply_attribute_transform,
+        AttributeAssignment, AttributeCondition, AttributeExtraction, AttributeValueSource,
+        AttributesTransform, InsertTransform, LiteralValue, UpsertTransform,
+        apply_attribute_transform,
     };
     use crate::proto::OtlpProtoMessage;
     use crate::proto::opentelemetry::common::v1::{AnyValue, InstrumentationScope, KeyValue};
@@ -328,6 +329,17 @@ mod tests {
         AttributeValueSource::FromAttribute {
             scope,
             key: key.to_owned(),
+            extract: None,
+        }
+    }
+
+    fn extracted(pattern: &str, group: &str) -> AttributeValueSource {
+        AttributeValueSource::FromAttribute {
+            scope: AttributeSourceScope::Scope,
+            key: "flow.id".to_owned(),
+            extract: Some(
+                AttributeExtraction::new(pattern, group.to_owned()).expect("valid extraction"),
+            ),
         }
     }
 
@@ -616,6 +628,7 @@ mod tests {
                         AttributeValueSource::FromAttribute {
                             scope: AttributeSourceScope::Scope,
                             key: "node.id".to_owned(),
+                            extract: None,
                         },
                         AttributeCondition {
                             scope: AttributeSourceScope::Scope,
@@ -749,6 +762,109 @@ mod tests {
         assert_eq!(
             value_of(&log_attributes(&otap_batch)[0], "componentName"),
             None
+        );
+    }
+
+    /// Scenario: A pipeline/component flow id is split into two attributes by named capture
+    /// groups over the same pattern.
+    /// Guarantees: Each written attribute takes its own group, reproducing the OTTL
+    /// `ExtractPatterns` plus `merge_maps` pair without a shared cache.
+    #[test]
+    fn named_capture_groups_are_written_as_separate_attributes() {
+        const PATTERN: &str = "^(?P<pipelineName>[^/]+)/(?P<componentName>.+)$";
+
+        let mut otap_batch = logs(
+            vec![],
+            vec![KeyValue::new(
+                "flow.id",
+                AnyValue::new_string("ingest/batcher"),
+            )],
+            vec![LogRecord::build().event_name("a").finish()],
+        );
+
+        let _ = apply_attribute_transform(
+            &mut otap_batch,
+            ArrowPayloadType::LogAttrs,
+            &AttributesTransform::default().with_insert(InsertTransform::with_sources(
+                [
+                    (
+                        "pipelineName".to_owned(),
+                        extracted(PATTERN, "pipelineName"),
+                    ),
+                    (
+                        "componentName".to_owned(),
+                        extracted(PATTERN, "componentName"),
+                    ),
+                ]
+                .into(),
+            )),
+            false,
+        )
+        .expect("transform");
+
+        let attributes = &log_attributes(&otap_batch)[0];
+        assert_eq!(
+            value_of(attributes, "pipelineName"),
+            Some(AnyValue::new_string("ingest"))
+        );
+        assert_eq!(
+            value_of(attributes, "componentName"),
+            Some(AnyValue::new_string("batcher"))
+        );
+    }
+
+    /// Scenario: The sourced value does not match the extraction pattern.
+    /// Guarantees: Nothing is written for that record, rather than an empty attribute.
+    #[test]
+    fn a_value_that_does_not_match_the_pattern_writes_nothing() {
+        let mut otap_batch = logs(
+            vec![],
+            vec![KeyValue::new("flow.id", AnyValue::new_string("no-slash"))],
+            vec![LogRecord::build().event_name("a").finish()],
+        );
+
+        let _ = apply_attribute_transform(
+            &mut otap_batch,
+            ArrowPayloadType::LogAttrs,
+            &AttributesTransform::default().with_insert(InsertTransform::with_sources(
+                [(
+                    "pipelineName".to_owned(),
+                    extracted(
+                        "^(?P<pipelineName>[^/]+)/(?P<componentName>.+)$",
+                        "pipelineName",
+                    ),
+                )]
+                .into(),
+            )),
+            false,
+        )
+        .expect("transform");
+
+        assert_eq!(
+            value_of(&log_attributes(&otap_batch)[0], "pipelineName"),
+            None
+        );
+    }
+
+    /// Scenario: An extraction names a capture group the pattern does not declare.
+    /// Guarantees: It is rejected when the extraction is built, not silently resolved to null
+    /// at every record.
+    #[test]
+    fn an_extraction_naming_an_unknown_group_is_rejected() {
+        let err = AttributeExtraction::new("^(?P<a>.+)$", "b".to_owned())
+            .expect_err("unknown group should be rejected");
+        assert!(format!("{err}").contains("no capture group 'b'"), "{err}");
+    }
+
+    /// Scenario: An extraction is built from a pattern the regex engine cannot compile.
+    /// Guarantees: The compile failure surfaces as a transform configuration error.
+    #[test]
+    fn an_invalid_pattern_is_rejected() {
+        let err = AttributeExtraction::new("^(?P<a>.+", "a".to_owned())
+            .expect_err("invalid pattern should be rejected");
+        assert!(
+            format!("{err}").contains("invalid extraction pattern"),
+            "{err}"
         );
     }
 }

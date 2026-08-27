@@ -7730,6 +7730,7 @@ dependencies = [
  "pretty_assertions",
  "prost 0.14.4",
  "rand 0.10.2",
+ "regex",
  "replace_with",
  "roaring",
  "serde",

@@ -49,6 +49,19 @@
 //!       equals: "receiver"
 //! ```
 //!
+//! A `from_attribute` reference may also carry a `pattern` and the `group` to read from it,
+//! writing one named capture group of the read value instead of the whole value:
+//! ```yaml
+//! actions:
+//!   - action: "insert"
+//!     key: "pipelineName"
+//!     from_attribute:
+//!       scope: "scope"
+//!       key: "flow.id"
+//!       pattern: "^(?P<pipelineName>[^/]+)/(?P<componentName>.+)$"
+//!       group: "pipelineName"
+//! ```
+//!
 //! Implementation uses otel_arrow_dfe_pdata::otap::transform::transform_attributes for
 //! efficient batch processing of Arrow record batches.
 
@@ -79,9 +92,10 @@ use otel_arrow_dfe_pdata::otap::transform::apply_attribute_transform;
 use otel_arrow_dfe_pdata::otap::{
     OtapArrowRecords,
     transform::{
-        AttributeAssignment, AttributeCondition, AttributeValueSource, AttributesTransform,
-        DeleteTransform, HashSpec, HashTransform, InsertTransform, LiteralValue, RenameTransform,
-        UpdateTransform, UpsertTransform, attribute_source::AttributeSourceScope,
+        AttributeAssignment, AttributeCondition, AttributeExtraction, AttributeValueSource,
+        AttributesTransform, DeleteTransform, HashSpec, HashTransform, InsertTransform,
+        LiteralValue, RenameTransform, UpdateTransform, UpsertTransform,
+        attribute_source::AttributeSourceScope,
     },
 };
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
@@ -188,6 +202,44 @@ pub struct AttributeRef {
     pub scope: AttributeSourceScope,
     /// The key to read.
     pub key: String,
+    /// Regular expression applied to the read value. Requires `group`.
+    #[serde(default)]
+    pub pattern: Option<String>,
+    /// Named capture group of `pattern` to write instead of the whole value.
+    #[serde(default)]
+    pub group: Option<String>,
+}
+
+impl AttributeRef {
+    fn into_value_source(
+        self,
+        action: &str,
+        key: &str,
+    ) -> Result<AttributeValueSource, ConfigError> {
+        let extract = match (self.pattern, self.group) {
+            (None, None) => None,
+            (Some(pattern), Some(group)) => {
+                Some(AttributeExtraction::new(&pattern, group).map_err(|e| {
+                    ConfigError::InvalidUserConfig {
+                        error: format!("{action} action for key '{key}': {e}"),
+                    }
+                })?)
+            }
+            _ => {
+                return Err(ConfigError::InvalidUserConfig {
+                    error: format!(
+                        "{action} action for key '{key}' sets only one of 'pattern' and 'group'; set both or neither"
+                    ),
+                });
+            }
+        };
+
+        Ok(AttributeValueSource::FromAttribute {
+            scope: self.scope,
+            key: self.key,
+            extract,
+        })
+    }
 }
 
 /// Restricts an action to the records where an attribute equals a given value.
@@ -222,10 +274,7 @@ fn assignment(
 ) -> Result<AttributeAssignment, ConfigError> {
     let value = match (value, from_attribute) {
         (Some(value), None) => AttributeValueSource::Literal(value),
-        (None, Some(source)) => AttributeValueSource::FromAttribute {
-            scope: source.scope,
-            key: source.key,
-        },
+        (None, Some(source)) => source.into_value_source(action, key)?,
         (Some(_), Some(_)) => {
             return Err(ConfigError::InvalidUserConfig {
                 error: format!(
@@ -975,6 +1024,133 @@ mod tests {
         );
         assert_eq!(component_name_for("processor"), None);
     }
+    /// Scenario: Two inserts read named capture groups of one pattern over the same attribute.
+    /// Guarantees: A `pipeline/component` flow id is split into two attributes, replacing the
+    /// OTTL `ExtractPatterns` plus `merge_maps` cache pair.
+    #[test]
+    fn test_named_capture_groups_split_one_attribute_into_two() {
+        let pattern = "^(?P<pipelineName>[^/]+)/(?P<componentName>.+)$";
+        let cfg = json!({
+            "actions": [
+                {
+                    "action": "insert",
+                    "key": "pipelineName",
+                    "from_attribute": {
+                        "scope": "scope", "key": "flow.id",
+                        "pattern": pattern, "group": "pipelineName"
+                    }
+                },
+                {
+                    "action": "insert",
+                    "key": "componentName",
+                    "from_attribute": {
+                        "scope": "scope", "key": "flow.id",
+                        "pattern": pattern, "group": "componentName"
+                    }
+                }
+            ]
+        });
+
+        let input = build_logs_with_attrs(
+            vec![],
+            vec![KeyValue::new(
+                "flow.id",
+                AnyValue::new_string("ingest/batcher"),
+            )],
+            vec![],
+        );
+
+        let rt: TestRuntime<OtapPdata> = TestRuntime::new();
+        let mut node_config = NodeUserConfig::new_processor_config(ATTRIBUTES_PROCESSOR_URN);
+        node_config.config = cfg;
+        let proc = create_attributes_processor(
+            pipeline_ctx(),
+            test_node("attributes-processor-extract-test"),
+            Arc::new(node_config),
+            rt.config(),
+        )
+        .expect("create processor");
+        let phase = rt.set_processor(proc);
+
+        phase
+            .run_test(|mut ctx| async move {
+                let mut bytes = BytesMut::new();
+                input.encode(&mut bytes).expect("encode");
+                let pdata_in = OtapPdata::new_default(
+                    OtlpProtoBytes::ExportLogsRequest(bytes.freeze()).into(),
+                );
+                ctx.process(Message::PData(pdata_in))
+                    .await
+                    .expect("process");
+
+                let out = ctx.drain_pdata().await;
+                let first = out.into_iter().next().expect("one output").payload();
+                let otlp_bytes: OtlpProtoBytes =
+                    first.try_into_with_default().expect("convert to otlp");
+                let OtlpProtoBytes::ExportLogsRequest(bytes) = otlp_bytes else {
+                    panic!("unexpected otlp variant")
+                };
+                let decoded = ExportLogsServiceRequest::decode(bytes.as_ref()).expect("decode");
+
+                let log_attrs = &decoded.resource_logs[0].scope_logs[0].log_records[0].attributes;
+                let value_of = |key: &str| {
+                    log_attrs
+                        .iter()
+                        .find(|kv| kv.key == key)
+                        .and_then(|kv| kv.value.clone())
+                };
+                assert_eq!(
+                    value_of("pipelineName"),
+                    Some(AnyValue::new_string("ingest"))
+                );
+                assert_eq!(
+                    value_of("componentName"),
+                    Some(AnyValue::new_string("batcher"))
+                );
+            })
+            .validate(|_| async move {});
+    }
+
+    /// Scenario: An attribute reference sets `pattern` without the `group` to read from it.
+    /// Guarantees: The incomplete extraction is rejected at config time.
+    #[test]
+    fn test_pattern_without_a_group_is_rejected() {
+        let cfg = json!({
+            "actions": [{
+                "action": "insert",
+                "key": "pipelineName",
+                "from_attribute": {"scope": "scope", "key": "flow.id", "pattern": "^(.+)$"}
+            }]
+        });
+        let Err(err) = AttributesProcessor::from_config(pipeline_ctx(), &cfg) else {
+            panic!("a pattern without a group should be rejected")
+        };
+        assert!(format!("{err}").contains("set both or neither"), "{err}");
+    }
+
+    /// Scenario: An extraction names a capture group its pattern does not declare.
+    /// Guarantees: The mismatch is rejected at config time rather than producing no output.
+    #[test]
+    fn test_group_missing_from_the_pattern_is_rejected() {
+        let cfg = json!({
+            "actions": [{
+                "action": "insert",
+                "key": "pipelineName",
+                "from_attribute": {
+                    "scope": "scope", "key": "flow.id",
+                    "pattern": "^(?P<other>.+)$", "group": "pipelineName"
+                }
+            }]
+        });
+        let Err(err) = AttributesProcessor::from_config(pipeline_ctx(), &cfg) else {
+            panic!("an unknown capture group should be rejected")
+        };
+        assert!(
+            format!("{err}").contains("no capture group 'pipelineName'"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn test_config_from_json_parses_actions_and_apply_to_default() {
         let cfg = json!({

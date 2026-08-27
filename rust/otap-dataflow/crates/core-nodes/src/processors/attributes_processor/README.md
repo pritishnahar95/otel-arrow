@@ -122,6 +122,25 @@ actions:
 Records where the condition does not hold are left untouched, including records
 whose tested attribute is missing.
 
+A `from_attribute` reference may also carry a `pattern` and the `group` to read
+from it, writing one named capture group of the read value instead of the whole
+value. Set both fields or neither; the group must be declared by the pattern:
+
+```yaml
+actions:
+  - action: insert
+    key: pipelineName
+    from_attribute:
+      scope: scope
+      key: flow.id
+      pattern: "^(?P<pipelineName>[^/]+)/(?P<componentName>.+)$"
+      group: pipelineName
+```
+
+Records whose value does not match the pattern are left untouched, so several
+actions can read different groups of one pattern to split a single attribute
+into several.
+
 Actions of one kind compose into a single map keyed by attribute key, so two
 `insert` actions (or two `upsert` actions) may not target the same key.
 

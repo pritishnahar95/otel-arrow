@@ -24,6 +24,7 @@ use arrow::row::{RowConverter, SortField};
 use arrow::util::bit_iterator::{BitIndexIterator, BitSliceIterator};
 use datafusion::logical_expr::ColumnarValue;
 use datafusion::scalar::ScalarValue;
+use regex::Regex;
 use sha2::{Digest, Sha256};
 
 use crate::OtapArrowRecords;
@@ -723,6 +724,48 @@ impl From<&LiteralValue> for ScalarValue {
     }
 }
 
+/// A named capture group pulled out of a sourced attribute value before it is written.
+///
+/// The analogue of OTTL's `ExtractPatterns`, restricted to reading one group per assignment so
+/// that each written attribute stays independently expressed.
+#[derive(Debug, Clone)]
+pub struct AttributeExtraction {
+    regex: Regex,
+    group: String,
+}
+
+impl PartialEq for AttributeExtraction {
+    fn eq(&self, other: &Self) -> bool {
+        self.regex.as_str() == other.regex.as_str() && self.group == other.group
+    }
+}
+
+impl AttributeExtraction {
+    /// Compiles `pattern` and checks that it declares a capture group named `group`.
+    pub fn new(pattern: &str, group: String) -> Result<Self> {
+        let regex = Regex::new(pattern).map_err(|e| Error::InvalidAttributeTransform {
+            reason: format!("invalid extraction pattern '{pattern}': {e}"),
+        })?;
+
+        if !regex.capture_names().flatten().any(|name| name == group) {
+            return Err(Error::InvalidAttributeTransform {
+                reason: format!("extraction pattern '{pattern}' has no capture group '{group}'"),
+            });
+        }
+
+        Ok(Self { regex, group })
+    }
+
+    /// The capture group's value, or `None` when the pattern does not match or the group did
+    /// not participate in the match.
+    fn extract<'a>(&self, value: &'a str) -> Option<&'a str> {
+        self.regex
+            .captures(value)?
+            .name(&self.group)
+            .map(|m| m.as_str())
+    }
+}
+
 /// Where the value written by an insert or upsert comes from.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AttributeValueSource {
@@ -735,6 +778,8 @@ pub enum AttributeValueSource {
         scope: AttributeSourceScope,
         /// The key to read.
         key: String,
+        /// Writes a capture group of the read value instead of the value itself.
+        extract: Option<AttributeExtraction>,
     },
 }
 
@@ -1549,9 +1594,14 @@ fn resolve_transform_sources(
         .chain(transform.upsert.iter().flat_map(|u| u.entries.iter()));
 
     for (attrs_key, assignment) in entries {
-        if let AttributeValueSource::FromAttribute { scope, key } = &assignment.value
+        if let AttributeValueSource::FromAttribute {
+            scope,
+            key,
+            extract,
+        } = &assignment.value
             && let Some(values) =
                 resolve_source_values(otap_batch, parent_payload_type, *scope, key.as_str())?
+            && let Some(values) = apply_extraction(&values, extract.as_ref())?
         {
             let _ = resolved.values.insert(attrs_key.clone(), values);
         }
@@ -1564,6 +1614,35 @@ fn resolve_transform_sources(
     }
 
     Ok(resolved)
+}
+
+/// Rewrites `values` to hold the extraction's capture group, leaving them untouched when the
+/// assignment declares no extraction.
+///
+/// Returns `None` when nothing can be extracted anywhere, which happens when the attribute is not
+/// a string. Rows that simply do not match the pattern become null.
+fn apply_extraction(
+    values: &ArrayRef,
+    extract: Option<&AttributeExtraction>,
+) -> Result<Option<ArrayRef>> {
+    let Some(extract) = extract else {
+        return Ok(Some(Arc::clone(values)));
+    };
+
+    if !matches!(values.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
+        return Ok(None);
+    }
+    let strings = StringArrayAccessor::try_new(values)?;
+
+    let extracted: StringArray = (0..values.len())
+        .map(|row| {
+            strings
+                .value_at(row)
+                .and_then(|value| extract.extract(value.as_ref()).map(str::to_owned))
+        })
+        .collect();
+
+    Ok(Some(Arc::new(extracted)))
 }
 
 /// Evaluates `condition` for every row of `parent_payload_type`.
