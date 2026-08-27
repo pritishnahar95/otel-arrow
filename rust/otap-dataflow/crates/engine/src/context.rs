@@ -1191,7 +1191,7 @@ mod tests {
 
         assert_eq!(schema, "node.channel.custom.attrs");
         assert!(
-            rendered.contains("custom={custom.identity.foo=bar}"),
+            rendered.contains("custom.identity.foo=bar"),
             "custom identity attributes missing from channel entity: {rendered}"
         );
         assert!(
@@ -1202,8 +1202,8 @@ mod tests {
 
     /// Scenario: a node with no `entity.extend.identity_attributes` registers a channel
     /// endpoint entity.
-    /// Guarantees: the entity stays on the plain channel schema and emits no empty
-    /// `custom={}` attribute, keeping telemetry output clean for unconfigured nodes.
+    /// Guarantees: the entity stays on the plain channel schema and emits no extra
+    /// attributes, keeping telemetry output clean for unconfigured nodes.
     #[test]
     fn register_node_channel_entity_omits_empty_custom_attributes() {
         let registry = TelemetryRegistryHandle::new();

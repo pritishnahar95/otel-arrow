@@ -109,7 +109,7 @@ pub struct MetricsDescriptor {
 }
 
 /// Supported attribute value kinds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttributeValueType {
     /// String attribute value

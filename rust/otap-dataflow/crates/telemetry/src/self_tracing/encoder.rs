@@ -1036,7 +1036,7 @@ mod tests {
         }],
     };
 
-    /// Mirrors engine::CustomAttributeSet: a single "custom" field of type Map.
+    /// An attribute set with a single "custom" field of type Map.
     #[derive(Debug)]
     struct TestMapAttributes {
         values: Vec<AttributeValue>,
@@ -1061,8 +1061,7 @@ mod tests {
     }
 
     /// Validate that Map attributes encode as OTLP kvlist values in
-    /// InstrumentationScope.attributes. This mirrors what CustomAttributeSet
-    /// does for user-defined node/pipeline attributes.
+    /// InstrumentationScope.attributes.
     #[test]
     fn encode_export_logs_request_with_map_scope_attribute() {
         let registry = TelemetryRegistryHandle::new();
