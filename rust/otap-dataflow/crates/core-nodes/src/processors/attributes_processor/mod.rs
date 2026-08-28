@@ -2219,6 +2219,198 @@ mod tests {
             .validate(|_| async move {});
     }
 
+    /// Scenario: The component-identity enrichment an internal-telemetry pipeline needs, as one
+    /// action list: promote the scope's own identity attributes, else the node id for receivers,
+    /// else the flow id for post-receiver filters, else the two halves of the flow id; then copy
+    /// two resource attributes down onto every data point.
+    /// Guarantees: Each scope takes the first branch that resolves for it, later branches leave
+    /// an already-written key alone, and resource copies apply to every scope.
+    #[test]
+    fn test_component_identity_fallback_chain_over_scope_attributes() {
+        const PATTERN: &str = "^(?P<pipelineName>[^/]+)/(?P<componentName>.+)$";
+
+        let scope_metrics = |scope_attrs: Vec<KeyValue>| ScopeMetrics {
+            scope: Some(
+                InstrumentationScope::build()
+                    .name("scope".to_string())
+                    .attributes(scope_attrs)
+                    .finish(),
+            ),
+            metrics: vec![
+                Metric::build()
+                    .name("m")
+                    .data_sum(Sum::new(
+                        0,
+                        true,
+                        vec![NumberDataPoint::build().value_int(1).finish()],
+                    ))
+                    .finish(),
+            ],
+            ..Default::default()
+        };
+
+        let input = MetricsData {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(
+                    Resource::build()
+                        .attributes(vec![
+                            KeyValue::new(
+                                "microsoft.pipeline.resourceId",
+                                AnyValue::new_string("/subscriptions/s/pipelineGroups/pg"),
+                            ),
+                            KeyValue::new("service.instance.id", AnyValue::new_string("pod-0")),
+                        ])
+                        .finish(),
+                ),
+                scope_metrics: vec![
+                    // Carries its own identity.
+                    scope_metrics(vec![
+                        KeyValue::new("custom.componentName", AnyValue::new_string("batcher")),
+                        KeyValue::new("custom.pipelineName", AnyValue::new_string("pipe1")),
+                    ]),
+                    // A receiver, named by its node id.
+                    scope_metrics(vec![
+                        KeyValue::new("node.type", AnyValue::new_string("receiver")),
+                        KeyValue::new("node.id", AnyValue::new_string("otlp")),
+                    ]),
+                    // A post-receiver filter, named by the whole flow id.
+                    scope_metrics(vec![
+                        KeyValue::new("flow.purpose", AnyValue::new_string("post_receiver_filter")),
+                        KeyValue::new("flow.id", AnyValue::new_string("pipe2/filter")),
+                    ]),
+                    // Named by the two halves of the flow id.
+                    scope_metrics(vec![
+                        KeyValue::new("flow.purpose", AnyValue::new_string("processor")),
+                        KeyValue::new("flow.id", AnyValue::new_string("pipe3/batch")),
+                    ]),
+                ],
+                ..Default::default()
+            }],
+        };
+
+        let cfg = json!({
+            "actions": [
+                {"action": "insert", "key": "componentName",
+                 "from_attribute": {"scope": "scope", "key": "custom.componentName"}},
+                {"action": "insert", "key": "pipelineName",
+                 "from_attribute": {"scope": "scope", "key": "custom.pipelineName"}},
+                {"action": "insert", "key": "componentName",
+                 "from_attribute": {"scope": "scope", "key": "node.id"},
+                 "condition": {"scope": "scope", "key": "node.type", "equals": "receiver"}},
+                {"action": "insert", "key": "componentName",
+                 "from_attribute": {"scope": "scope", "key": "flow.id"},
+                 "condition": {"scope": "scope", "key": "flow.purpose",
+                               "equals": "post_receiver_filter"}},
+                {"action": "insert", "key": "pipelineName",
+                 "from_attribute": {"scope": "scope", "key": "flow.id",
+                                    "pattern": PATTERN, "group": "pipelineName"}},
+                {"action": "insert", "key": "componentName",
+                 "from_attribute": {"scope": "scope", "key": "flow.id",
+                                    "pattern": PATTERN, "group": "componentName"}},
+                {"action": "insert", "key": "microsoft.pipeline.resourceId",
+                 "from_attribute": {"scope": "resource", "key": "microsoft.pipeline.resourceId"}},
+                {"action": "insert", "key": "instanceId",
+                 "from_attribute": {"scope": "resource", "key": "service.instance.id"}},
+            ],
+            "apply_to": ["signal"]
+        });
+
+        let metrics_registry_handle = TelemetryRegistryHandle::new();
+        let controller_ctx = ControllerContext::new(metrics_registry_handle);
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+
+        let node = test_node("attributes-processor-component-identity");
+        let rt: TestRuntime<OtapPdata> = TestRuntime::new();
+        let mut node_config = NodeUserConfig::new_processor_config(ATTRIBUTES_PROCESSOR_URN);
+        node_config.config = cfg;
+        let proc =
+            create_attributes_processor(pipeline_ctx, node, Arc::new(node_config), rt.config())
+                .expect("create processor");
+        let phase = rt.set_processor(proc);
+        phase
+            .run_test(|mut ctx| async move {
+                let mut bytes = BytesMut::new();
+                input.encode(&mut bytes).expect("encode");
+                let pdata_in = OtapPdata::new_default(
+                    OtlpProtoBytes::ExportMetricsRequest(bytes.freeze()).into(),
+                );
+                ctx.process(Message::PData(pdata_in))
+                    .await
+                    .expect("process");
+
+                let out = ctx.drain_pdata().await;
+                let first = out.into_iter().next().expect("one output").payload();
+                let otlp_bytes: OtlpProtoBytes =
+                    first.try_into_with_default().expect("convert to otlp");
+                let OtlpProtoBytes::ExportMetricsRequest(bytes) = otlp_bytes else {
+                    panic!("unexpected otlp variant");
+                };
+                let decoded = MetricsData::decode(bytes.as_ref()).expect("decode");
+
+                let resource_metrics = &decoded.resource_metrics[0];
+                let attrs_of = |index: usize, key: &str| {
+                    let metric = &resource_metrics.scope_metrics[index].metrics[0];
+                    let Data::Sum(sum) = metric.data.as_ref().expect("data") else {
+                        panic!("invalid data");
+                    };
+                    sum.data_points[0]
+                        .attributes
+                        .iter()
+                        .find(|kv| kv.key == key)
+                        .and_then(|kv| kv.value.clone())
+                };
+
+                for index in 0..4 {
+                    assert_eq!(
+                        attrs_of(index, "microsoft.pipeline.resourceId"),
+                        Some(AnyValue::new_string("/subscriptions/s/pipelineGroups/pg")),
+                        "scope {index}"
+                    );
+                    assert_eq!(
+                        attrs_of(index, "instanceId"),
+                        Some(AnyValue::new_string("pod-0")),
+                        "scope {index}"
+                    );
+                }
+
+                assert_eq!(
+                    attrs_of(0, "componentName"),
+                    Some(AnyValue::new_string("batcher"))
+                );
+                assert_eq!(
+                    attrs_of(0, "pipelineName"),
+                    Some(AnyValue::new_string("pipe1"))
+                );
+
+                assert_eq!(
+                    attrs_of(1, "componentName"),
+                    Some(AnyValue::new_string("otlp"))
+                );
+                assert_eq!(attrs_of(1, "pipelineName"), None, "no flow id to split");
+
+                assert_eq!(
+                    attrs_of(2, "componentName"),
+                    Some(AnyValue::new_string("pipe2/filter")),
+                    "the whole flow id, not its second half"
+                );
+                assert_eq!(
+                    attrs_of(2, "pipelineName"),
+                    Some(AnyValue::new_string("pipe2"))
+                );
+
+                assert_eq!(
+                    attrs_of(3, "componentName"),
+                    Some(AnyValue::new_string("batch"))
+                );
+                assert_eq!(
+                    attrs_of(3, "pipelineName"),
+                    Some(AnyValue::new_string("pipe3"))
+                );
+            })
+            .validate(|_| async move {});
+    }
+
     #[test]
     fn test_insert_int_value_via_config() {
         // Test inserting an integer value via JSON configuration
