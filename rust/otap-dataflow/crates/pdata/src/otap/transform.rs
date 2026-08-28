@@ -755,15 +755,6 @@ impl AttributeExtraction {
 
         Ok(Self { regex, group })
     }
-
-    /// The capture group's value, or `None` when the pattern does not match or the group did
-    /// not participate in the match.
-    fn extract<'a>(&self, value: &'a str) -> Option<&'a str> {
-        self.regex
-            .captures(value)?
-            .name(&self.group)
-            .map(|m| m.as_str())
-    }
 }
 
 /// Where the value written by an insert or upsert comes from.
@@ -1577,6 +1568,83 @@ impl ResolvedSources {
 }
 
 /// Resolves every sourced value and every condition in `transform` against the whole batch.
+/// Caches the per-batch work shared by the entries of one transform.
+///
+/// Reading an attribute builds a parent-id index and takes a column, and an extraction runs a
+/// regex over every row. Several entries commonly read one attribute -- a fallback chain gated on
+/// the same condition, or two entries taking different capture groups of one pattern -- so both
+/// results are keyed by what they were derived from and reused.
+#[derive(Default)]
+struct SourceCache<'a> {
+    values: HashMap<(AttributeSourceScope, &'a str), Option<ArrayRef>>,
+    groups: HashMap<(AttributeSourceScope, &'a str, &'a str), Option<HashMap<String, ArrayRef>>>,
+    wanted: HashMap<(AttributeSourceScope, &'a str, &'a str), Vec<&'a str>>,
+}
+
+impl<'a> SourceCache<'a> {
+    /// Records which capture group each extraction reads, so that a pattern is materialized for
+    /// those groups alone rather than for every group it happens to declare.
+    fn new(entries: &[(&'a String, &'a AttributeAssignment)]) -> Self {
+        let mut cache = Self::default();
+        for (_, assignment) in entries {
+            if let AttributeValueSource::FromAttribute {
+                scope,
+                key,
+                extract: Some(extract),
+            } = &assignment.value
+            {
+                let names = cache
+                    .wanted
+                    .entry((*scope, key.as_str(), extract.regex.as_str()))
+                    .or_default();
+                let group = extract.group.as_str();
+                if !names.contains(&group) {
+                    names.push(group);
+                }
+            }
+        }
+        cache
+    }
+
+    fn values(
+        &mut self,
+        otap_batch: &OtapArrowRecords,
+        parent_payload_type: ArrowPayloadType,
+        scope: AttributeSourceScope,
+        key: &'a str,
+    ) -> Result<Option<ArrayRef>> {
+        if let Some(hit) = self.values.get(&(scope, key)) {
+            return Ok(hit.clone());
+        }
+
+        let resolved = resolve_source_values(otap_batch, parent_payload_type, scope, key)?;
+        let _ = self.values.insert((scope, key), resolved.clone());
+        Ok(resolved)
+    }
+
+    fn group(
+        &mut self,
+        values: &ArrayRef,
+        scope: AttributeSourceScope,
+        key: &'a str,
+        extract: &'a AttributeExtraction,
+    ) -> Result<Option<ArrayRef>> {
+        let cache_key = (scope, key, extract.regex.as_str());
+        if !self.groups.contains_key(&cache_key) {
+            let wanted = self.wanted.get(&cache_key).cloned().unwrap_or_default();
+            let groups = extract_groups(values, &extract.regex, &wanted)?;
+            let _ = self.groups.insert(cache_key, groups);
+        }
+
+        Ok(self
+            .groups
+            .get(&cache_key)
+            .and_then(|groups| groups.as_ref())
+            .and_then(|groups| groups.get(extract.group.as_str()))
+            .map(Arc::clone))
+    }
+}
+
 fn resolve_transform_sources(
     otap_batch: &OtapArrowRecords,
     parent_payload_type: ArrowPayloadType,
@@ -1587,11 +1655,14 @@ fn resolve_transform_sources(
         return Ok(resolved);
     }
 
-    let entries = transform
+    let entries: Vec<_> = transform
         .insert
         .iter()
         .flat_map(|i| i.entries.iter())
-        .chain(transform.upsert.iter().flat_map(|u| u.entries.iter()));
+        .chain(transform.upsert.iter().flat_map(|u| u.entries.iter()))
+        .collect();
+
+    let mut cache = SourceCache::new(&entries);
 
     for (attrs_key, assignment) in entries {
         if let AttributeValueSource::FromAttribute {
@@ -1600,14 +1671,25 @@ fn resolve_transform_sources(
             extract,
         } = &assignment.value
             && let Some(values) =
-                resolve_source_values(otap_batch, parent_payload_type, *scope, key.as_str())?
-            && let Some(values) = apply_extraction(&values, extract.as_ref())?
+                cache.values(otap_batch, parent_payload_type, *scope, key.as_str())?
         {
-            let _ = resolved.values.insert(attrs_key.clone(), values);
+            let value = match extract {
+                Some(extract) => cache.group(&values, *scope, key.as_str(), extract)?,
+                None => Some(values),
+            };
+            if let Some(value) = value {
+                let _ = resolved.values.insert(attrs_key.clone(), value);
+            }
         }
 
         if let Some(condition) = &assignment.condition
-            && let Some(holds) = evaluate_condition(otap_batch, parent_payload_type, condition)?
+            && let Some(values) = cache.values(
+                otap_batch,
+                parent_payload_type,
+                condition.scope,
+                condition.key.as_str(),
+            )?
+            && let Some(holds) = evaluate_condition(&values, condition)?
         {
             let _ = resolved.conditions.insert(attrs_key.clone(), holds);
         }
@@ -1616,54 +1698,64 @@ fn resolve_transform_sources(
     Ok(resolved)
 }
 
-/// Rewrites `values` to hold the extraction's capture group, leaving them untouched when the
-/// assignment declares no extraction.
+/// Runs `regex` once per row and materializes the capture groups named in `wanted`.
 ///
 /// Returns `None` when nothing can be extracted anywhere, which happens when the attribute is not
-/// a string. Rows that simply do not match the pattern become null.
-fn apply_extraction(
+/// a string. Rows that simply do not match the pattern become null in every group.
+fn extract_groups(
     values: &ArrayRef,
-    extract: Option<&AttributeExtraction>,
-) -> Result<Option<ArrayRef>> {
-    let Some(extract) = extract else {
-        return Ok(Some(Arc::clone(values)));
-    };
-
+    regex: &Regex,
+    wanted: &[&str],
+) -> Result<Option<HashMap<String, ArrayRef>>> {
     if !matches!(values.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
         return Ok(None);
     }
+
     let strings = StringArrayAccessor::try_new(values)?;
-
-    let extracted: StringArray = (0..values.len())
-        .map(|row| {
-            strings
-                .value_at(row)
-                .and_then(|value| extract.extract(value.as_ref()).map(str::to_owned))
-        })
+    let names: Vec<&str> = regex
+        .capture_names()
+        .flatten()
+        .filter(|name| wanted.contains(name))
         .collect();
+    let mut builders: Vec<StringBuilder> = names.iter().map(|_| StringBuilder::new()).collect();
 
-    Ok(Some(Arc::new(extracted)))
+    for row in 0..values.len() {
+        let captures = match strings.value_at(row) {
+            Some(value) => regex.captures(value.as_ref()).map(|captures| {
+                names
+                    .iter()
+                    .map(|name| captures.name(name).map(|m| m.as_str().to_owned()))
+                    .collect::<Vec<_>>()
+            }),
+            None => None,
+        };
+
+        for (index, builder) in builders.iter_mut().enumerate() {
+            builder.append_option(
+                captures
+                    .as_ref()
+                    .and_then(|groups| groups[index].as_deref()),
+            );
+        }
+    }
+
+    Ok(Some(
+        names
+            .into_iter()
+            .zip(builders.iter_mut())
+            .map(|(name, builder)| (name.to_owned(), Arc::new(builder.finish()) as ArrayRef))
+            .collect(),
+    ))
 }
 
-/// Evaluates `condition` for every row of `parent_payload_type`.
+/// Evaluates `condition` against the values of its attribute, one entry per row of the parent.
 ///
-/// Returns `None` when the condition cannot hold anywhere, either because the tested attribute is
-/// unreachable or because its type cannot compare equal to the literal.
+/// Returns `None` when the condition cannot hold anywhere, because the attribute's type cannot
+/// compare equal to the literal.
 fn evaluate_condition(
-    otap_batch: &OtapArrowRecords,
-    parent_payload_type: ArrowPayloadType,
+    values: &ArrayRef,
     condition: &AttributeCondition,
 ) -> Result<Option<BooleanArray>> {
-    let Some(values) = resolve_source_values(
-        otap_batch,
-        parent_payload_type,
-        condition.scope,
-        condition.key.as_str(),
-    )?
-    else {
-        return Ok(None);
-    };
-
     let compared = match (values.data_type(), &condition.equals) {
         (DataType::Utf8, LiteralValue::Str(expected)) => {
             eq(&values, &StringArray::new_scalar(expected))

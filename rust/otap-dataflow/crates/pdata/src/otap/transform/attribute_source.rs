@@ -25,7 +25,7 @@ use crate::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 use crate::schema::consts;
 
 /// Where an attribute value is read from, relative to the record being written.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttributeSourceScope {
     /// The resource the record belongs to.
@@ -809,6 +809,45 @@ mod tests {
         );
         assert_eq!(
             value_of(attributes, "componentName"),
+            Some(AnyValue::new_string("batcher"))
+        );
+    }
+
+    /// Scenario: Two entries extract from the same attribute with different patterns.
+    /// Guarantees: Each entry gets the captures of its own pattern, so the per-batch cache of
+    /// extraction results is keyed by pattern and not by source attribute alone.
+    #[test]
+    fn different_patterns_over_one_attribute_do_not_share_captures() {
+        let mut otap_batch = logs(
+            vec![],
+            vec![KeyValue::new(
+                "flow.id",
+                AnyValue::new_string("ingest/batcher"),
+            )],
+            vec![LogRecord::build().event_name("a").finish()],
+        );
+
+        let _ = apply_attribute_transform(
+            &mut otap_batch,
+            ArrowPayloadType::LogAttrs,
+            &AttributesTransform::default().with_insert(InsertTransform::with_sources(
+                [
+                    ("head".to_owned(), extracted("^(?P<part>[^/]+)/.+$", "part")),
+                    ("tail".to_owned(), extracted("^[^/]+/(?P<part>.+)$", "part")),
+                ]
+                .into(),
+            )),
+            false,
+        )
+        .expect("transform");
+
+        let attributes = &log_attributes(&otap_batch)[0];
+        assert_eq!(
+            value_of(attributes, "head"),
+            Some(AnyValue::new_string("ingest"))
+        );
+        assert_eq!(
+            value_of(attributes, "tail"),
             Some(AnyValue::new_string("batcher"))
         );
     }

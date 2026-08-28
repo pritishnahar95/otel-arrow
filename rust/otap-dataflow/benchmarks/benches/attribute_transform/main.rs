@@ -18,10 +18,20 @@ use std::hint::black_box;
 use std::sync::Arc;
 
 use otel_arrow_dfe_pdata::otap::transform::{
-    AttributesTransform, DeleteTransform, LiteralValue, RenameTransform, UpsertTransform,
-    transform_attributes, transform_attributes_with_stats,
+    AttributeAssignment, AttributeExtraction, AttributeValueSource, AttributesTransform,
+    DeleteTransform, InsertTransform, LiteralValue, RenameTransform, UpsertTransform,
+    apply_attribute_transform, attribute_source::AttributeSourceScope, transform_attributes,
+    transform_attributes_with_stats,
 };
+use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{
+    AnyValue, InstrumentationScope, KeyValue,
+};
+use otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::{
+    LogRecord, LogsData, ResourceLogs, ScopeLogs,
+};
+use otel_arrow_dfe_pdata::proto::opentelemetry::resource::v1::Resource;
 use otel_arrow_dfe_pdata::schema::{FieldExt, consts};
+use otel_arrow_dfe_pdata::testing::round_trip::encode_logs;
 
 #[cfg(not(windows))]
 use tikv_jemallocator::Jemalloc;
@@ -736,13 +746,96 @@ fn bench_upsert_attributes(c: &mut Criterion) {
     group.finish();
 }
 
+/// Reading N capture groups out of one attribute should cost one regex pass, not N, because the
+/// source read and the captures are cached per batch.
+fn bench_extract_attributes(c: &mut Criterion) {
+    const PATTERN: &str = "^(?P<pipelineName>[^/]+)/(?P<componentName>.+)$";
+
+    let insert_group = |keys: &[&str]| {
+        let entries = keys
+            .iter()
+            .map(|group| {
+                (
+                    (*group).to_string(),
+                    AttributeAssignment::new(AttributeValueSource::FromAttribute {
+                        scope: AttributeSourceScope::Scope,
+                        key: "flow.id".to_string(),
+                        extract: Some(
+                            AttributeExtraction::new(PATTERN, (*group).to_string())
+                                .expect("valid extraction"),
+                        ),
+                    }),
+                )
+            })
+            .collect();
+        AttributesTransform::default().with_insert(InsertTransform::with_assignments(entries))
+    };
+
+    let one_group = insert_group(&["pipelineName"]);
+    let two_groups = insert_group(&["pipelineName", "componentName"]);
+
+    let mut group = c.benchmark_group("extract_attributes");
+
+    for num_records in [128, 1536, 8192] {
+        let logs = LogsData::new(vec![ResourceLogs::new(
+            Resource::build().finish(),
+            vec![ScopeLogs::new(
+                InstrumentationScope::build()
+                    .name("scope".to_string())
+                    .attributes(vec![KeyValue::new(
+                        "flow.id",
+                        AnyValue::new_string("ingest/batcher"),
+                    )])
+                    .finish(),
+                (0..num_records)
+                    .map(|i| {
+                        LogRecord::build()
+                            .event_name(format!("event_{i}"))
+                            .attributes(vec![KeyValue::new(
+                                "existing",
+                                AnyValue::new_string("value"),
+                            )])
+                            .finish()
+                    })
+                    .collect::<Vec<LogRecord>>(),
+            )],
+        )]);
+        let otap_batch = encode_logs(&logs);
+        let id = format!("records={num_records}");
+
+        for (name, transform) in [("one_group", &one_group), ("two_groups", &two_groups)] {
+            let _ = group.bench_with_input(
+                BenchmarkId::new(name, &id),
+                &otap_batch,
+                |b, otap_batch| {
+                    b.iter_batched(
+                        || otap_batch.clone(),
+                        |mut otap_batch| {
+                            apply_attribute_transform(
+                                black_box(&mut otap_batch),
+                                ArrowPayloadType::LogAttrs,
+                                transform,
+                                false,
+                            )
+                            .expect("no error")
+                        },
+                        BatchSize::SmallInput,
+                    );
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
 #[allow(missing_docs)]
 mod benches {
     use super::*;
     criterion_group!(
         name = benches;
         config = Criterion::default();
-        targets = bench_transform_attributes, bench_transport_optimized_transform_attributes, bench_upsert_attributes
+        targets = bench_transform_attributes, bench_transport_optimized_transform_attributes, bench_upsert_attributes, bench_extract_attributes
     );
 }
 criterion_main!(benches::benches);

@@ -1,0 +1,19 @@
+# One of 'breaking', 'deprecation', 'new_component', 'enhancement', 'bug_fix'
+change_type: enhancement
+
+# The name of the component, or a single word describing the area of concern, (e.g. otlp, pipeline, engine)
+component: pdata
+
+# A brief description of the change. Surround your text with quotes ("") if it needs to start with a backtick (`).
+note: Resolve each attribute source and each extraction pattern once per batch instead of once per action
+
+# One or more tracking issues related to the change
+issues: []
+
+# (Optional) One or more lines of additional information to render under the primary note.
+# These lines will be padded with 2 spaces and then inserted directly into the document.
+# Use pipe (|) for multiline entries.
+subtext: |
+  Fallback chains gated on one condition, and patterns split across capture groups, now cost one
+  read and one regex pass rather than one per action. Only the capture groups an action reads are
+  materialized.
