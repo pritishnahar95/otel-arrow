@@ -8144,6 +8144,76 @@ mod test {
         test_update_attr_coalesce_missing_attributes::<KqlParser>().await
     }
 
+    /// Scenario: `coalesce` falls back from attribute reads to `body`, which is an `AnyValue`
+    /// column rather than a string one, over a batch whose bodies have mixed types.
+    /// Guarantees: The mixed argument list plans and the body is picked only when both
+    /// attributes are absent, with the result coerced to the arguments' common type.
+    async fn test_update_attr_coalesce_falls_back_to_body<P: Parser>() {
+        let logs_data = to_logs_data(vec![
+            LogRecord::build()
+                .attributes(vec![
+                    KeyValue::new("message", AnyValue::new_string("M")),
+                    KeyValue::new("error", AnyValue::new_string("E")),
+                ])
+                .body(AnyValue::new_string("B"))
+                .finish(),
+            LogRecord::build()
+                .attributes(vec![KeyValue::new("error", AnyValue::new_string("E"))])
+                .body(AnyValue::new_string("B"))
+                .finish(),
+            LogRecord::build()
+                .attributes(vec![])
+                .body(AnyValue::new_string("B"))
+                .finish(),
+            LogRecord::build()
+                .attributes(vec![])
+                .body(AnyValue::new_int(418))
+                .finish(),
+            LogRecord::build().attributes(vec![]).finish(),
+        ]);
+
+        let query = r#"logs | extend attributes["message"] = coalesce(attributes["message"], attributes["error"], body)"#;
+        let pipeline_expr = P::parse_with_options(query, default_parser_options())
+            .unwrap()
+            .pipeline;
+        let mut pipeline = Pipeline::new(pipeline_expr);
+
+        let input = otlp_to_otap(&OtlpProtoMessage::Logs(logs_data));
+        let result = pipeline.execute(input).await.unwrap();
+        let OtlpProtoMessage::Logs(result_logs_data) = otap_to_otlp(&result) else {
+            panic!("invalid signal type");
+        };
+
+        let records = &result_logs_data.resource_logs[0].scope_logs[0].log_records;
+        assert_eq!(records.len(), 5, "no logs should be dropped");
+
+        let message = |record: &LogRecord| {
+            record
+                .attributes
+                .iter()
+                .find(|kv| kv.key == "message")
+                .and_then(|kv| kv.value.clone())
+        };
+
+        assert_eq!(message(&records[0]), Some(AnyValue::new_string("M")));
+        assert_eq!(message(&records[1]), Some(AnyValue::new_string("E")));
+        assert_eq!(message(&records[2]), Some(AnyValue::new_string("B")));
+        // Coalescing against string arguments coerces to the common string type.
+        assert_eq!(message(&records[3]), Some(AnyValue::new_string("418")));
+        // Every argument null still writes the key, as an explicit null.
+        assert_eq!(message(&records[4]), Some(AnyValue { value: None }));
+    }
+
+    #[tokio::test]
+    async fn test_update_attr_coalesce_falls_back_to_body_opl_parser() {
+        test_update_attr_coalesce_falls_back_to_body::<OplParser>().await
+    }
+
+    #[tokio::test]
+    async fn test_update_attr_coalesce_falls_back_to_body_kql_parser() {
+        test_update_attr_coalesce_falls_back_to_body::<KqlParser>().await
+    }
+
     async fn test_update_attr_to_lower_case_function_call<P: Parser>() {
         let logs_data = to_logs_data(vec![
             LogRecord::build()
